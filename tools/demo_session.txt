@@ -1,0 +1,24 @@
+# A sample session:  build/bin/fsh demo.img < tools/demo_session.txt
+sb
+mkdir /docs
+write /docs/report.txt first draft
+ls /docs
+stat /docs/report.txt
+snap monday
+write /docs/report.txt second draft
+snap tuesday
+write /docs/report.txt final version
+mkdir /docs/old
+cp /docs/report.txt /docs/old/copy.txt
+ls /docs
+snaps
+catsnap monday /docs/report.txt
+back 2
+cat /docs/report.txt
+ls /docs
+df
+sb
+fsck
+commit
+write /docs/report.txt not committed
+crash
