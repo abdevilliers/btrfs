@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 
-#define BLOCK_SIZE 64u /* small blocks keep the demo readable */
+#define BLOCK_SIZE 128u /* small blocks keep the demo readable */
 
 typedef struct Disk Disk;
 

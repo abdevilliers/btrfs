@@ -76,19 +76,37 @@ void vol_destroy(Volume *v)
     }
 }
 
-int vol_write(Volume *v, uint32_t page, const char *text)
+int vol_write_page(Volume *v, uint32_t page, const void *buf)
 {
-    char buf[BLOCK_SIZE] = { 0 };
-
     if (page >= VOL_PAGES)
         return -EINVAL;
     if (alloc_free(v->alloc) < 3)
         return -ENOSPC; /* the data block + a copied root + a copied leaf */
 
     uint32_t data = alloc_block(v->alloc);
-    snprintf(buf, sizeof buf, "%s", text);
     disk_write(v->disk, data, buf);
     return vol_map_page(v, page, data); /* the tree owns it now */
+}
+
+int vol_write(Volume *v, uint32_t page, const char *text)
+{
+    char buf[BLOCK_SIZE] = { 0 };
+    snprintf(buf, sizeof buf, "%s", text);
+    return vol_write_page(v, page, buf);
+}
+
+void vol_read_page_tree(Volume *v, uint32_t root, uint32_t page, void *buf)
+{
+    uint32_t data = cowtree_get(v->tree, root, page);
+    if (data)
+        disk_read(v->disk, data, buf);
+    else
+        memset(buf, 0, BLOCK_SIZE); /* an empty page reads as zeros */
+}
+
+void vol_read_page(Volume *v, uint32_t page, void *buf)
+{
+    vol_read_page_tree(v, v->s.root, page, buf);
 }
 
 int vol_erase(Volume *v, uint32_t page)

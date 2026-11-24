@@ -1,13 +1,16 @@
 # btrfs: a btrfs-style copy-on-write storage project
 
 This is a small, readable model of how btrfs stores data, built in C as abstract
-data types. A shared **core** provides the copy-on-write tree and reference counts.
-Each team member builds one **feature** on top of it, in its own folder.
+data types. A shared **core** provides the copy-on-write tree, reference counts, and
+a Unix-style **filesystem** stored inside it: inodes, directories and files, with
+Bach's `ialloc` / `ifree` (free inode list) and `alloc` / `free` (chained free block
+list). The advanced features run on top of normal file reads and writes. Each team member builds one **feature** on top of it, in its own folder.
 
-| Feature | Folder | Status |
+| Part | Folder | Status |
 |---|---|---|
+| Filesystem: files, directories, `ialloc`/`ifree`, `alloc`/`free`, `namei`, `bmap`, hard links, fsck | `core/` (`fs.h`, see [`core/FILESYSTEM.md`](core/FILESYSTEM.md)) | Done: tests and a shell |
 | Checkpointing (snapshots): by hand or at fixed times, go back x checkpoints | `features/checkpoint/` | Done: tests and demos |
-| Duplication (copy a page without copying its data) | `features/duplication/` | Done: tests and demo |
+| Duplication (copy a page or a whole file without copying its data) | `features/duplication/` | Done: tests and demo |
 | Recovery (commit, crash, mount) | `features/recovery/` | Done: tests and demo |
 | Backup (send/receive) | `features/backup/` | To do |
 
@@ -17,6 +20,7 @@ Each team member builds one **feature** on top of it, in its own folder.
 make          # build everything into build/
 make test     # core tests, then every feature's tests
 make demo     # every feature's demo
+make shell    # an interactive filesystem shell on fsh.img (tools/fsh.c)
 make clean
 ```
 
@@ -36,9 +40,19 @@ btrfs/
 │   │   ├── file_disk.h       concrete Disk in a file (survives the program)
 │   │   ├── allocator.h       Allocator  reference count per block, commit marks
 │   │   ├── cowtree.h         CowTree    copy-on-write tree: get, set, share, drop
-│   │   └── volume.h          Volume     live pages + root table of named trees
-│   ├── src/                  implementations (+ disk_impl.h, private)
-│   └── tests/test_core.c
+│   │   ├── volume.h          Volume     live pages + root table of named trees
+│   │   └── fs.h              Fs         files, directories, inodes, in the pages
+│   ├── src/                  implementations (+ disk_impl.h, fs_impl.h: private)
+│   │   ├── fs_block.c        bread/bwrite, superblock, alloc and free
+│   │   ├── fs_inode.c        iget/iupdate, ialloc, ifree, itrunc, bmap
+│   │   ├── fs_dir.c          directories, namei
+│   │   ├── fs.c              mkfs and the file operations
+│   │   └── fs_check.c        fsck
+│   ├── tests/                test_core.c, test_fs.c
+│   └── FILESYSTEM.md         the filesystem's data structures and flows
+├── tools/
+│   ├── fsh.c                 the filesystem shell
+│   └── demo_session.txt      a sample session to pipe into it
 └── features/
     ├── checkpoint/           checkpoints, timed checkpoints, go back x
     │   ├── include/checkpoint.h
@@ -55,7 +69,9 @@ btrfs/
 ```text
    checkpoint   duplication   recovery   backup     features (one owner each)
         \           |            |          /
-         └──────── volume.h ───────────────┘        core: public API
+         └───────── fs.h ──────────────────┘        core: the filesystem
+                      │
+                  volume.h                          core: pages + root table
                       │
                   cowtree.h
                       │
@@ -93,7 +109,11 @@ btrfs/
 
 | Need | Core API |
 |---|---|
-| Read and write live pages | `vol_write`, `vol_read`, `vol_erase` |
+| Files and directories | `fs_format`, `fs_open`, `fs_create`, `fs_mkdir`, `fs_write`, `fs_read`, `fs_unlink`, `fs_rmdir`, `fs_link`, `fs_truncate`, `fs_stat`, `fs_readdir` |
+| The filesystem as it is in a checkpoint | `fs_open_tree` (read-only) |
+| Which page holds part of a file | `fs_bmap` |
+| Check the filesystem | `fs_check` (fsck) |
+| Read and write live pages | `vol_write`, `vol_read`, `vol_erase`, `vol_write_page`, `vol_read_page` |
 | Keep a named, read-only tree (snapshot, backup base) | `vol_root_add`, `vol_root_find`, `vol_root_remove`, `vol_root_each` |
 | Find the n-th newest named tree | `vol_root_nth` |
 | Point a page at an existing data block | `vol_map_page` |
@@ -109,8 +129,12 @@ btrfs/
 
 ## Simplifications compared with real btrfs
 
-- A fixed two-level page map (16 pages) instead of a B+tree.
-- Numbered pages instead of files and directories.
+- A fixed two-level page map (32 × 32 = 1,024 pages of 128 bytes) instead of a
+  B+tree.
+- The filesystem is a classic inode filesystem (like ext2 or xv6) stored in those
+  pages, with Bach's allocation algorithms: 64 inodes, 12 direct blocks per inode
+  (files up to 1,536 bytes), 46 names per directory. Btrfs instead keeps inodes and directory entries as items in its FS
+  tree. No rename, permissions or timestamps.
 - The root table is a small array saved inside the superblock. In btrfs it is the
   on-disk root tree.
 - Reference counts are not stored on disk: mount rebuilds them by walking the

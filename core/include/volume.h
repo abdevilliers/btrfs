@@ -19,7 +19,7 @@
 #include "cowtree.h"
 #include "disk.h"
 
-#define VOL_PAGES 16      /* pages are numbered 0 .. VOL_PAGES-1 */
+#define VOL_PAGES 1024    /* pages are numbered 0 .. VOL_PAGES-1 */
 #define VOL_NAME_MAX 31   /* longest name in the root table      */
 #define VOL_MAX_ROOTS 8   /* entries the root table can hold     */
 
@@ -40,6 +40,13 @@ void vol_destroy(Volume *v);    /* forgets the volume; the disk is not touched  
 int vol_write(Volume *v, uint32_t page, const char *text);
 int vol_erase(Volume *v, uint32_t page);
 int vol_read(Volume *v, uint32_t page, char *buf, size_t len); /* -ENOENT if empty */
+
+/* The same as raw pages of BLOCK_SIZE bytes (used by the filesystem).
+ * Reading an empty page gives zeros. vol_read_page_tree reads from any
+ * tree (the live one or a root-table entry). */
+int vol_write_page(Volume *v, uint32_t page, const void *buf);
+void vol_read_page(Volume *v, uint32_t page, void *buf);
+void vol_read_page_tree(Volume *v, uint32_t root, uint32_t page, void *buf);
 
 uint32_t vol_used_blocks(const Volume *v);
 

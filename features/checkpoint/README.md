@@ -6,7 +6,8 @@ after it.
 
 ```sh
 make test    # runs build/bin/test_checkpoint (with the core tests)
-make demo    # runs build/bin/demo_checkpoint: a step-by-step story with every refcount
+make demo    # runs build/bin/demo_checkpoint: files created, checkpointed, updated,
+             # read from the checkpoint, rolled back
              # and build/bin/demo_timed_checkpoints: timed checkpoints, then go back 3
 
 build/bin/demo_timed_checkpoints 4    # go back 4 checkpoints instead (any x)
@@ -16,11 +17,11 @@ build/bin/demo_timed_checkpoints 4    # go back 4 checkpoints instead (any x)
 
 | File | Contents |
 |---|---|
-| `include/checkpoint.h` | Public API. By name: `ckpt_create`, `ckpt_read`, `ckpt_rollback`, `ckpt_delete`. By position: `ckpt_rollback_back`, `ckpt_name_back`, `ckpt_count`. At fixed times: `CkptTimer` |
+| `include/checkpoint.h` | Public API. `ckpt_open_fs`: the filesystem as it was in a checkpoint, read-only. By name: `ckpt_create`, `ckpt_read`, `ckpt_rollback`, `ckpt_delete`. By position: `ckpt_rollback_back`, `ckpt_name_back`, `ckpt_count`. At fixed times: `CkptTimer` |
 | `src/checkpoint.c` | The implementation, using only `volume.h` |
 | `tests/test_checkpoint.c` | Behaviour checks, plus 20,000 random operations compared with a model and `vol_check()` after every step |
-| `demo/demo_checkpoint.c` | Prints both trees after each step |
-| `demo/demo_timed_checkpoints.c` | Checkpoints every 10 time units, then goes back x (x from the command line) |
+| `demo/demo_checkpoint.c` | Files made with the file operations; checkpoint (0 blocks written), update, read the old version, roll back |
+| `demo/demo_timed_checkpoints.c` | A file updated over time, checkpoints every 10 time units, then go back x (x from the command line) |
 
 ## How it works
 
@@ -30,6 +31,23 @@ build/bin/demo_timed_checkpoints 4    # go back 4 checkpoints instead (any x)
 | `ckpt_read(v, "v1", p, …)` | `vol_root_find` + `vol_read_tree` | Reads the checkpoint's tree |
 | `ckpt_rollback(v, "v1")` | `vol_set_live_root(v, root of v1)` | Live volume takes v1's tree; its old tree is dropped |
 | `ckpt_delete(v, "v1")` | `vol_root_remove(v, "v1")` | Drops the entry's reference; frees what only v1 used |
+
+## Checkpoints of the filesystem
+
+The filesystem (`core/FILESYSTEM.md`) lives in the volume's pages, so a checkpoint
+is a snapshot of every file, directory and inode, and of both free lists. Nothing
+here knows about files: sharing the root is enough.
+
+```c
+ckpt_create(v, "monday");
+fs_write(fs, "/report.txt", 0, "FINAL", 5);        /* the live filesystem changes */
+
+Fs *old = ckpt_open_fs(v, "monday");               /* monday's filesystem, read-only */
+fs_read(old, "/report.txt", 0, buf, sizeof buf);   /* the old text */
+fs_close(old);
+
+ckpt_rollback(v, "monday");                        /* files, directories, inodes: all back */
+```
 
 ## Go back x checkpoints
 
@@ -81,19 +99,25 @@ core because every feature relies on it.
 ## Demo output (abridged)
 
 ```text
-==== 2. Take checkpoint "v1" ====
-blocks written: 0   blocks in use: 7 (+0)   reference counts: OK
+==== 2. Take checkpoint "monday" ====
+disk blocks written: 0   disk blocks in use: 123   free inodes: 59   fsck: clean   reference counts: OK
 
-==== 3. Change page 1 in the live volume ====
-live volume:
-  root #25  refs 1
-    leaf #26  refs 1   (pages 0-3)
-      page 1  -> data #24  refs 1   "chapter 1, FINAL"
-    leaf #22  refs 2  shared   (pages 4-7)
-"v1":
-  root #17  refs 1
-    leaf #19  refs 1   (pages 0-3)
-      page 1  -> data #20  refs 1   "chapter 1, draft"
-    leaf #22  refs 2  shared   (pages 4-7)
-blocks written: 3   blocks in use: 10 (+3)   reference counts: OK
+==== 3. Update report.txt, delete notes.txt, create todo.txt ====
+  /docs/report.txt     inode 3   "v2: FINAL version"
+  /docs/notes.txt      (no such file)
+  /docs/todo.txt       inode 4   "buy milk"
+
+==== 4. Look inside "monday" (read-only) ====
+  /docs/report.txt     inode 3   "v1: first draft"
+  /docs/notes.txt      inode 4   "meeting at 10"
+  /docs/todo.txt       (no such file)
+
+==== 5. Roll back to "monday" ====
+  /docs/report.txt     inode 3   "v1: first draft"
+  /docs/notes.txt      inode 4   "meeting at 10"
+disk blocks written: 0   ...   fsck: clean   reference counts: OK
 ```
+
+`ifree` put notes.txt's inode (4) back in the free inode list, and `ialloc` gave it to
+todo.txt. The checkpoint still holds the old inode table, so rollback brings notes.txt
+back as inode 4.

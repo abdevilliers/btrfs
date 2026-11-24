@@ -13,6 +13,7 @@
 
 #include "checkpoint.h"
 #include "file_disk.h"
+#include "fs.h"
 #include "mem_disk.h"
 #include "recovery.h"
 #include "volume.h"
@@ -184,6 +185,12 @@ static void test_file_disk(void)
 #define NCK 4
 typedef char Pages[VOL_PAGES][BLOCK_SIZE]; /* "" = empty page */
 
+/* The random tests use 16 pages, one in each of 16 different leaves. */
+static uint32_t spread(int i)
+{
+    return (uint32_t)i * (VOL_PAGES / 16 + 1);
+}
+
 static void test_random(void)
 {
     Disk *d = mem_disk_create(512);
@@ -197,7 +204,7 @@ static void test_random(void)
     srand(3);
     for (int step = 0; step < 20000; step++) {
         int op = rand() % 20, k = rand() % NCK;
-        uint32_t page = (uint32_t)(rand() % VOL_PAGES);
+        uint32_t page = spread(rand() % 16);
         snprintf(name, sizeof name, "c%d", k);
 
         if (op < 10) {                                    /* write */
@@ -238,7 +245,7 @@ static void test_random(void)
             crashes++;
         }
 
-        for (uint32_t p = 0; p < VOL_PAGES; p++) {
+        for (uint32_t p = 0; p < VOL_PAGES; p += VOL_PAGES / 16 + 1) {
             CHECK(page_is(v, NULL, p, live[p][0] ? live[p] : NULL));
             for (int c = 0; c < NCK; c++)
                 if (has[c]) {
@@ -253,8 +260,44 @@ static void test_random(void)
     printf("ok   20000 random operations with %d commits and %d crashes\n", commits, crashes);
 }
 
+/* Files and directories come back after a crash, and the filesystem
+ * is consistent (fsck clean). */
+static void test_files_survive(void)
+{
+    Disk *d = mem_disk_create(1024);
+    Volume *v = vol_create(d);
+    char buf[64];
+    FsStat st;
+
+    CHECK(fs_format(v) == 0);
+    Fs *fs = fs_open(v);
+    CHECK(fs_mkdir(fs, "/home") == 0);
+    CHECK(fs_create(fs, "/home/a.txt") == 0);
+    CHECK(fs_write(fs, "/home/a.txt", 0, "kept", 4) == 4);
+    CHECK(rec_commit(v) == 0);
+
+    CHECK(fs_write(fs, "/home/a.txt", 0, "LOST", 4) == 4); /* after the commit */
+    CHECK(fs_create(fs, "/home/b.txt") == 0);
+    CHECK(fs_rmdir(fs, "/home") == -ENOTEMPTY);
+    fs_close(fs);
+
+    v = crash_and_mount(v, d);
+    fs = fs_open(v);
+    CHECK(fs != NULL);
+    CHECK(fs_read(fs, "/home/a.txt", 0, buf, sizeof buf) == 4 && memcmp(buf, "kept", 4) == 0);
+    CHECK(fs_stat(fs, "/home/b.txt", &st) == -ENOENT);
+    CHECK(fs_check(fs) == 0);
+    CHECK(fs_create(fs, "/home/b.txt") == 0);              /* and it keeps working */
+
+    fs_close(fs);
+    vol_destroy(v);
+    disk_close(d);
+    printf("ok   files and directories survive a crash; fsck is clean after mount\n");
+}
+
 int main(void)
 {
+    test_files_survive();
     test_commit_and_crash();
     test_checkpoints_survive();
     test_interrupted_commit();

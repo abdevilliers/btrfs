@@ -4,11 +4,13 @@
  * The tree maps a page number to the disk block holding that page's data.
  * It has a fixed shape, like an inode's block map:
  *
- *            root                 one node: TREE_FANOUT leaf pointers
+ *            root                 one node: TREE_FANOUT (32) leaf pointers
  *         /   |   \
  *     leaf  leaf  leaf            each: TREE_FANOUT data-block pointers
  *     /  \    ...
- *   data data                     page n is in leaf n / FANOUT, slot n % FANOUT
+ *   data data                     page n is in leaf n / 32, slot n % 32
+ *
+ * So one tree holds 32 x 32 = 1024 pages.
  *
  * A tree is named by its root block, so many trees (the live volume and
  * every checkpoint) can share nodes and data blocks. Sharing is recorded
@@ -27,7 +29,7 @@
 #include "allocator.h"
 #include "disk.h"
 
-#define TREE_FANOUT 4                            /* pointers per node */
+#define TREE_FANOUT 32                           /* pointers per node: one 128-byte block */
 #define TREE_PAGES (TREE_FANOUT * TREE_FANOUT)   /* pages per tree    */
 
 typedef struct CowTree CowTree;

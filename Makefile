@@ -3,6 +3,7 @@
 #   make            build every library, test and demo into build/
 #   make test       run core tests, then every feature's tests
 #   make demo       run every feature's demo
+#   make shell      the filesystem shell (tools/fsh.c), on fsh.img
 #   make clean
 #
 # Features are found automatically: any folder features/<name>/ with
@@ -27,12 +28,14 @@ HEADERS  := $(wildcard core/include/*.h core/src/*.h features/*/include/*.h)
 
 TEST_SRC := $(wildcard core/tests/*.c) $(foreach f,$(FEATURES),$(wildcard features/$(f)/tests/*.c))
 DEMO_SRC := $(foreach f,$(FEATURES),$(wildcard features/$(f)/demo/*.c))
+TOOL_SRC := $(wildcard tools/*.c)
 TESTS    := $(addprefix $(BUILD)/bin/,$(basename $(notdir $(TEST_SRC))))
 DEMOS    := $(addprefix $(BUILD)/bin/,$(basename $(notdir $(DEMO_SRC))))
+TOOLS    := $(addprefix $(BUILD)/bin/,$(basename $(notdir $(TOOL_SRC))))
 
-vpath %.c $(sort $(dir $(TEST_SRC) $(DEMO_SRC)))
+vpath %.c $(sort $(dir $(TEST_SRC) $(DEMO_SRC) $(TOOL_SRC)))
 
-all: $(LIB) $(TESTS) $(DEMOS)
+all: $(LIB) $(TESTS) $(DEMOS) $(TOOLS)
 
 # Core may also use its private headers in core/src (e.g. disk_impl.h).
 $(BUILD)/core/%.o: core/%.c $(HEADERS)
@@ -58,7 +61,11 @@ test: $(TESTS)
 demo: $(DEMOS)
 	@set -e; for d in $(DEMOS); do echo "== $$d"; ./$$d; done
 
+# The filesystem shell: an interactive session on fsh.img.
+shell: $(BUILD)/bin/fsh
+	./$(BUILD)/bin/fsh
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test demo clean
+.PHONY: all test demo shell clean

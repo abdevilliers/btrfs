@@ -1,11 +1,12 @@
 # Feature: recovery
 
 After a crash, the volume comes back exactly as it was at the last commit: the live
-pages and every checkpoint. It is never left half-changed.
+pages and every checkpoint, and so the whole filesystem (files, directories, inodes)
+stored in them. `fs_open(v)` after `rec_mount` finds it, and `fs_check` is clean. It is never left half-changed.
 
 ```sh
 make test    # runs build/bin/test_recovery (with the other tests)
-make demo    # runs build/bin/demo_recovery: commit, crash, mount, on a file-backed disk
+make demo    # runs build/bin/demo_recovery: files, commit, crash, mount, on a file-backed disk
 ```
 
 ## Files
@@ -15,7 +16,7 @@ make demo    # runs build/bin/demo_recovery: commit, crash, mount, on a file-bac
 | `include/recovery.h` | Public API: `rec_commit`, `rec_mount`, `rec_generation` |
 | `src/recovery.c` | The superblock, commit and mount, using only `volume.h` |
 | `tests/test_recovery.c` | Commit and crash, checkpoints surviving, a half-written commit, a file-backed disk, and 20,000 random operations with about 2,000 commits and 2,000 crashes compared with a model |
-| `demo/demo_recovery.c` | The same story, printed step by step |
+| `demo/demo_recovery.c` | Files written, committed, changed, crash, mount: the committed files come back |
 
 ## Using it
 

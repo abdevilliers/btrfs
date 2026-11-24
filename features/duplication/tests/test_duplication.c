@@ -9,6 +9,7 @@
 
 #include "checkpoint.h"
 #include "duplication.h"
+#include "fs.h"
 #include "mem_disk.h"
 #include "volume.h"
 
@@ -114,6 +115,12 @@ static void test_with_checkpoint(void)
     printf("ok   works together with checkpoints\n");
 }
 
+/* The random test uses 16 pages, one in each of 16 different leaves. */
+static uint32_t spread(int i)
+{
+    return (uint32_t)i * (VOL_PAGES / 16 + 1);
+}
+
 /* Random writes, erases and duplications, compared with a plain model. */
 static void test_random(void)
 {
@@ -123,7 +130,7 @@ static void test_random(void)
 
     srand(11);
     for (int step = 0; step < 5000; step++) {
-        uint32_t a = (uint32_t)(rand() % VOL_PAGES), b = (uint32_t)(rand() % VOL_PAGES);
+        uint32_t a = spread(rand() % 16), b = spread(rand() % 16);
         int op = rand() % 4;
 
         if (op == 0) {
@@ -140,7 +147,7 @@ static void test_random(void)
             if (r == 0)
                 memmove(model[b], model[a], sizeof model[b]);
         }
-        for (uint32_t p = 0; p < VOL_PAGES; p++)
+        for (uint32_t p = 0; p < VOL_PAGES; p += VOL_PAGES / 16 + 1)
             CHECK(page_is(v, p, model[p][0] ? model[p] : NULL));
         CHECK(vol_check(v) == 0);
     }
@@ -149,8 +156,58 @@ static void test_random(void)
     printf("ok   5000 random writes, erases and duplications\n");
 }
 
+static void test_copy_file(void)
+{
+    Disk *d = mem_disk_create(1024);
+    Volume *v = vol_create(d);
+    char text[600], buf[600];
+    FsStat a, b;
+
+    for (int i = 0; i < 600; i++)
+        text[i] = (char)('a' + i % 26);
+    CHECK(fs_format(v) == 0);
+    Fs *fs = fs_open(v);
+    CHECK(fs_create(fs, "/big.txt") == 0);
+    CHECK(fs_write(fs, "/big.txt", 0, text, 600) == 600); /* 5 pages */
+    uint32_t used = vol_used_blocks(v);
+
+    CHECK(dup_copy_file(fs, "/big.txt", "/copy.txt") == 0);
+    CHECK(fs_stat(fs, "/big.txt", &a) == 0 && fs_stat(fs, "/copy.txt", &b) == 0);
+    CHECK(a.ino != b.ino && b.size == 600 && b.blocks == 5); /* its own inode and pages */
+    CHECK(fs_read(fs, "/copy.txt", 0, buf, 600) == 600 && memcmp(buf, text, 600) == 0);
+    for (uint32_t i = 0; i < 5; i++) {
+        uint32_t pa, pb;
+        CHECK(fs_bmap(fs, "/big.txt", i, 0, &pa) == 0 && fs_bmap(fs, "/copy.txt", i, 0, &pb) == 0);
+        CHECK(pa != pb && dup_is_shared(v, pa, pb));       /* same data block */
+    }
+    CHECK(vol_used_blocks(v) < used + 5);                  /* no data block was copied */
+
+    CHECK(fs_write(fs, "/copy.txt", 130, "XYZ", 3) == 3);   /* writes page 1 of the copy */
+    CHECK(fs_read(fs, "/big.txt", 0, buf, 600) == 600 && memcmp(buf, text, 600) == 0);
+    uint32_t pa, pb;
+    CHECK(fs_bmap(fs, "/big.txt", 1, 0, &pa) == 0 && fs_bmap(fs, "/copy.txt", 1, 0, &pb) == 0);
+    CHECK(!dup_is_shared(v, pa, pb));                      /* only that page split */
+    CHECK(fs_bmap(fs, "/big.txt", 2, 0, &pa) == 0 && fs_bmap(fs, "/copy.txt", 2, 0, &pb) == 0);
+    CHECK(dup_is_shared(v, pa, pb));
+
+    CHECK(fs_unlink(fs, "/big.txt") == 0);                 /* the copy keeps its data */
+    CHECK(fs_read(fs, "/copy.txt", 0, buf, 3) == 3 && memcmp(buf, "abc", 3) == 0);
+    CHECK(dup_copy_file(fs, "/missing", "/x") == -ENOENT);
+    CHECK(fs_mkdir(fs, "/dir") == 0);
+    CHECK(dup_copy_file(fs, "/dir", "/x") == -EISDIR);
+    CHECK(dup_copy_file(fs, "/copy.txt", "/dir") == -EEXIST);
+    CHECK(fs_check(fs) == 0);
+    CHECK(vol_check(v) == 0);
+
+    fs_close(fs);
+    vol_destroy(v);
+    disk_close(d);
+    printf("ok   copy a file: new inode, shared data blocks, split on write\n");
+}
+
 int main(void)
 {
+    test_copy_file();
     test_copy();
     test_independent();
     test_with_checkpoint();

@@ -46,6 +46,12 @@ int ckpt_delete(Volume *v, const char *name)
     return vol_root_remove(v, name);
 }
 
+Fs *ckpt_open_fs(Volume *v, const char *name)
+{
+    uint32_t root;
+    return vol_root_find(v, name, &root) == 0 ? fs_open_tree(v, root) : NULL;
+}
+
 /* -------------------------------------------------------- by position */
 
 int ckpt_rollback_back(Volume *v, uint32_t x)

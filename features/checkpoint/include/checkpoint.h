@@ -19,6 +19,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "fs.h"
 #include "volume.h"
 
 #define CKPT_NAME_MAX VOL_NAME_MAX
@@ -29,6 +30,12 @@ int ckpt_create(Volume *v, const char *name);   /* -EEXIST, -ENOSPC, -EINVAL */
 int ckpt_read(Volume *v, const char *name, uint32_t page, char *buf, size_t len);
 int ckpt_rollback(Volume *v, const char *name); /* live volume = checkpoint   */
 int ckpt_delete(Volume *v, const char *name);   /* frees what only it used    */
+
+/* The filesystem as it was in a checkpoint, read-only (fs_read, fs_stat,
+ * fs_readdir work; changes return -EROFS). Close it with fs_close before
+ * the checkpoint is deleted. NULL if there is no such checkpoint, or no
+ * filesystem in it. */
+Fs *ckpt_open_fs(Volume *v, const char *name);
 
 /* ------------------------------------------------- by position
  *

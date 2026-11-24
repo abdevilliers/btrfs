@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "checkpoint.h"
+#include "fs.h"
 #include "mem_disk.h"
 #include "volume.h"
 
@@ -68,6 +69,12 @@ static void test_basics(void)
 #define NCK 4
 typedef char Pages[VOL_PAGES][BLOCK_SIZE]; /* "" = empty page */
 
+/* The random tests use 16 pages, one in each of 16 different leaves. */
+static uint32_t spread(int i)
+{
+    return (uint32_t)i * (VOL_PAGES / 16 + 1);
+}
+
 static void test_random(void)
 {
     Disk *d = mem_disk_create(512);
@@ -80,7 +87,7 @@ static void test_random(void)
     srand(7);
     for (int step = 0; step < 20000; step++) {
         int op = rand() % 10, k = rand() % NCK;
-        uint32_t page = (uint32_t)(rand() % VOL_PAGES);
+        uint32_t page = spread(rand() % 16);
         snprintf(name, sizeof name, "c%d", k);
 
         if (op < 5) {                                     /* write */
@@ -108,7 +115,7 @@ static void test_random(void)
             CHECK(ckpt_delete(v, name) == 0);
             has[k] = 0;
         } else {                                          /* verify everything */
-            for (uint32_t p = 0; p < VOL_PAGES; p++) {
+            for (uint32_t p = 0; p < VOL_PAGES; p += VOL_PAGES / 16 + 1) {
                 CHECK(page_is(v, NULL, p, live[p][0] ? live[p] : NULL));
                 for (int c = 0; c < NCK; c++)
                     if (has[c]) {
@@ -218,8 +225,70 @@ static void test_timer(void)
     printf("ok   checkpoints at fixed times, keeping the newest 3\n");
 }
 
+/* Checkpoints of a whole filesystem: files, directories and the inode
+ * free list all come back on rollback. */
+static int fs_has(Fs *fs, const char *path, const char *want)
+{
+    char buf[FS_MAX_FILE + 1];
+    int n = fs_read(fs, path, 0, buf, FS_MAX_FILE);
+    if (!want)
+        return n == -ENOENT;
+    if (n < 0)
+        return 0;
+    buf[n] = '\0';
+    return strcmp(buf, want) == 0;
+}
+
+static void test_files(void)
+{
+    Disk *d = mem_disk_create(1024);
+    Volume *v = vol_create(d);
+    FsInfo before, after;
+    FsStat st;
+
+    CHECK(fs_format(v) == 0);
+    Fs *fs = fs_open(v);
+    CHECK(fs_mkdir(fs, "/docs") == 0);
+    CHECK(fs_create(fs, "/docs/report.txt") == 0);
+    CHECK(fs_write(fs, "/docs/report.txt", 0, "draft", 5) == 5);
+    CHECK(fs_info(fs, &before) == 0);
+
+    CHECK(ckpt_create(v, "monday") == 0);             /* the whole filesystem, 0 copies */
+
+    CHECK(fs_write(fs, "/docs/report.txt", 0, "FINAL", 5) == 5);
+    CHECK(fs_create(fs, "/docs/new.txt") == 0);        /* takes an inode off the free list */
+    CHECK(fs_unlink(fs, "/docs/report.txt") == 0);     /* gives one back */
+    CHECK(fs_mkdir(fs, "/tmp") == 0);
+    CHECK(fs_check(fs) == 0);
+
+    Fs *old = ckpt_open_fs(v, "monday");               /* look inside the checkpoint */
+    CHECK(old != NULL);
+    CHECK(fs_has(old, "/docs/report.txt", "draft"));
+    CHECK(fs_has(old, "/docs/new.txt", NULL));
+    CHECK(fs_stat(old, "/tmp", &st) == -ENOENT);
+    CHECK(fs_create(old, "/x") == -EROFS);             /* read-only */
+    CHECK(fs_check(old) == 0);
+    fs_close(old);
+
+    CHECK(ckpt_rollback(v, "monday") == 0);            /* back to monday, everything */
+    CHECK(fs_has(fs, "/docs/report.txt", "draft"));
+    CHECK(fs_has(fs, "/docs/new.txt", NULL));
+    CHECK(fs_stat(fs, "/tmp", &st) == -ENOENT);
+    CHECK(fs_info(fs, &after) == 0);
+    CHECK(after.inodes_free == before.inodes_free);    /* free inode list restored too */
+    CHECK(after.blocks_free == before.blocks_free);
+    CHECK(fs_check(fs) == 0);
+    CHECK(vol_check(v) == 0);
+
+    fs_close(fs);
+    vol_destroy(v);
+    disk_close(d);
+    printf("ok   checkpoints of a filesystem: read an old file, roll back files and inodes\n");
+}
+
 int main(void)
 {
+    test_files();
     test_basics();
     test_go_back();
     test_timer();
