@@ -1,26 +1,26 @@
 /*
  * demo_recovery.c - a filesystem that survives a crash.
  *
- * The volume lives in a file (recovery_demo.img), so the "disk" outlives
- * the program. Files are written with the normal file operations; a crash
- * is simulated by throwing everything in memory away without committing
- * and opening the image again.
+ * The disk is a file (recovery_demo.img), so it outlives the program.
+ * A crash throws away everything in memory without committing and opens
+ * the image again. Then: a commit cut off by a power failure, and a
+ * damaged superblock.
  */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "checkpoint.h"
+#include "fault_disk.h"
 #include "file_disk.h"
 #include "fs.h"
 #include "recovery.h"
-#include "volume.h"
 
 #define IMAGE "recovery_demo.img"
-#define BLOCKS 2048
+#define BLOCKS 20000 /* 78 MiB: room for the superblock copy at 64 MiB */
 
 static Disk *disk;
-static Volume *vol;
+static Btrfs *b;
 static Fs *fs;
 
 static void must(int r, const char *what)
@@ -34,98 +34,112 @@ static void must(int r, const char *what)
 static void put(const char *path, const char *text)
 {
     int r = fs_create(fs, path);
-    if (r < 0 && r != -17 /* EEXIST */)
+    if (r < 0 && r != -EEXIST)
         must(r, "create");
     must(fs_truncate(fs, path, 0), "truncate");
-    must(fs_write(fs, path, 0, text, (uint32_t)strlen(text)), "write");
+    must((int)fs_write(fs, path, 0, text, strlen(text)), "write");
 }
 
 static void entry(void *arg, const char *name, const FsStat *st)
 {
-    char path[64], buf[FS_MAX_FILE + 1];
+    char path[64], buf[64];
     if (st->type != FS_FILE)
         return;
     snprintf(path, sizeof path, "%s/%s", (const char *)arg, name);
-    int n = fs_read(fs, path, 0, buf, FS_MAX_FILE);
+    int64_t n = fs_read(fs, path, 0, buf, sizeof buf - 1);
     buf[n > 0 ? n : 0] = '\0';
     printf("  %-22s \"%s\"\n", path, buf);
 }
 
 static void show(void)
 {
-    char name[CKPT_NAME_MAX + 1];
     fs_readdir(fs, "/bank", entry, "/bank");
-    for (uint32_t x = 1; ckpt_name_back(vol, x, name) == 0; x++)
-        printf("  checkpoint \"%s\"\n", name);
-    printf("  fsck: %s   reference counts: %s\n", fs_check(fs) ? "PROBLEMS" : "clean",
-           vol_check(vol) ? "WRONG" : "OK");
+    printf("  last commit on disk: generation %llu\n", (unsigned long long)rec_generation(disk));
 }
 
-/* Lose everything in memory, keep only the image file, and mount it. */
+/* Lose everything in memory; keep only the image file; mount it. */
 static void crash(void)
 {
+    const char *how[] = { "a plain mount", "-o usebackuproot", "btrfs rescue super-recover" };
+    int h;
     fs_close(fs);
-    vol_destroy(vol);
+    btrfs_crash(b);
     disk_close(disk);
     disk = file_disk_open(IMAGE, BLOCKS);
     if (!disk)
         exit(1);
-    must(rec_mount(disk, &vol), "mount");
-    fs = fs_open(vol);
-    if (!fs)
-        exit(1);
-    printf("  ** crash **  mounted commit %u from the file\n", rec_generation(disk));
+    must(rec_mount(disk, &b, &h), "mount");
+    fs = fs_open(b);
+    printf("  ** crash **  mounted generation %llu (%s); btrfs check: %s\n", (unsigned long long)btrfs_generation(b),
+           how[h], btrfs_check(disk, 0) ? "PROBLEMS" : "clean");
 }
 
 int main(void)
 {
-    char junk[BLOCK_SIZE];
+    BtrfsMkfsOpts o = { 4096, NULL };
+    uint8_t junk[BLOCK_SIZE];
 
     remove(IMAGE);
     disk = file_disk_open(IMAGE, BLOCKS);
-    vol = disk ? vol_create(disk) : NULL;
-    if (!vol || fs_format(vol) < 0 || !(fs = fs_open(vol)))
+    if (!disk || btrfs_mkfs(disk, &o) < 0 || btrfs_mount(disk, NULL, &b) < 0 || !(fs = fs_open(b)))
         return 1;
 
-    printf("==== 1. Make files, take a checkpoint, update, COMMIT ====\n");
+    printf("==== 1. Make files, COMMIT ====\n");
     must(fs_mkdir(fs, "/bank"), "mkdir");
-    put("/bank/balance.txt", "100");
-    must(ckpt_create(vol, "monday"), "checkpoint");
     put("/bank/balance.txt", "250");
     put("/bank/log.txt", "paid in 150");
-    must(rec_commit(vol), "commit");
+    must(rec_commit(b), "commit");
     show();
 
-    printf("\n==== 2. More changes, NOT committed ====\n");
+    printf("\n==== 2. More changes, NOT committed, then a crash ====\n");
     put("/bank/balance.txt", "999999");
     must(fs_unlink(fs, "/bank/log.txt"), "unlink");
     put("/bank/hack.txt", "oops");
-    must(ckpt_delete(vol, "monday"), "delete");
     show();
-
-    printf("\n==== 3. Crash before the next commit ====\n");
     crash();
     show();
-    printf("-> exactly the state of step 1: files, inodes and free lists as committed,\n"
-           "   and the deleted checkpoint is back.\n");
+    printf("-> exactly the state of step 1.\n");
 
-    printf("\n==== 4. A commit that is cut off halfway ====\n");
+    printf("\n==== 3. A commit cut off by a power failure ====\n");
     put("/bank/balance.txt", "300");
+    fs_close(fs);
+    btrfs_crash(b);
+    Disk *fd = fault_disk_wrap(disk);
+    must(btrfs_mount(fd, NULL, &b), "mount");
+    fs = fs_open(b);
+    put("/bank/balance.txt", "300");
+    fault_disk_cut_after(fd, 4); /* the power goes after 4 writes of the commit */
+    rec_commit(b);
+    printf("  the commit wrote 4 blocks; %llu more never reached the disk\n",
+           (unsigned long long)fault_disk_dropped(fd));
+    fs_close(fs);
+    btrfs_crash(b);
+    disk_close(fd);
+    fs = NULL;
+    b = NULL;
+    {
+        int h;
+        must(rec_mount(disk, &b, &h), "mount");
+        fs = fs_open(b);
+        printf("  ** power back **  mounted generation %llu; btrfs check: %s\n",
+               (unsigned long long)btrfs_generation(b), btrfs_check(disk, 0) ? "PROBLEMS" : "clean");
+    }
+    show();
+    printf("-> some new tree blocks reached the disk, but not the superblock that would\n"
+           "   point at them; the old commit was never overwritten (copy-on-write).\n");
+
+    printf("\n==== 4. The primary superblock is damaged ====\n");
+    put("/bank/balance.txt", "300");
+    must(rec_commit(b), "commit");
     memset(junk, 0x5a, sizeof junk);
-    disk_write(disk, 1, junk); /* commit 2 would write blocks 1-8; only block 1 got out */
-    printf("  commit 2 started writing its superblock, then the power went\n");
+    disk_write(disk, 16, junk); /* the superblock at 64 KiB */
+    printf("  the superblock at 64 KiB is now garbage\n");
     crash();
     show();
-    printf("-> the damaged superblock fails its checksum, so mount used commit 1.\n");
-
-    printf("\n==== 5. Commit properly, crash again ====\n");
-    put("/bank/balance.txt", "300");
-    must(rec_commit(vol), "commit");
-    crash();
-    show();
+    printf("-> the mirror at 64 MiB was copied back over it.\n");
 
     fs_close(fs);
-    vol_destroy(vol);
+    btrfs_unmount(b);
     disk_close(disk);
     remove(IMAGE);
     return 0;

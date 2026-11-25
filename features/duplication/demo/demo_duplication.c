@@ -1,12 +1,10 @@
 /*
- * demo_duplication.c - copying a file without copying its data.
- *
- * A file is written with the normal file operations, then copied with
- * dup_copy_file (cp --reflink). The copy gets its own inode (ialloc) and
- * its own filesystem blocks (alloc), but each of them points at the same
- * disk block as the original. Updating the copy splits only the block
- * that changes.
+ * demo_duplication.c - copying a file without copying its data
+ * (cp --reflink). For each file it prints its extents (FIEMAP) and, for
+ * each data extent, the extent item's reference count and its
+ * back-references from the extent tree.
  */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,12 +12,11 @@
 #include "duplication.h"
 #include "fs.h"
 #include "mem_disk.h"
-#include "volume.h"
 
 static Disk *disk;
-static Volume *vol;
+static Btrfs *b;
 static Fs *fs;
-static uint64_t writes_before;
+static BtrfsStats before;
 
 static void must(int r, const char *what)
 {
@@ -32,75 +29,103 @@ static void must(int r, const char *what)
 static void step(const char *title)
 {
     printf("\n==== %s ====\n", title);
-    writes_before = disk_write_count(disk);
+    btrfs_commit(b); /* run the delayed refs, so the extent tree is current */
+    btrfs_stats(b, &before);
 }
 
-/* Each block of a file: filesystem block -> disk block (reference count). */
+/* Print the extent item and back-references of one data extent. */
+static int show_ref(void *arg, const BtrfsKey *k, const void *data, uint32_t len)
+{
+    (void)arg;
+    (void)len;
+    if (k->type == BTRFS_EXTENT_ITEM_KEY) {
+        BtrfsExtentItem ei;
+        memcpy(&ei, data, sizeof ei);
+        printf("refs %llu:", (unsigned long long)ei.refs);
+    } else if (k->type == BTRFS_EXTENT_DATA_REF_KEY) {
+        BtrfsExtentDataRef dr;
+        memcpy(&dr, data, sizeof dr);
+        printf(" [subvol %llu inode %llu x%u]", (unsigned long long)dr.root, (unsigned long long)dr.objectid,
+               dr.count);
+    }
+    return 0;
+}
+
+static void show_extent(void *arg, const FsExtent *e)
+{
+    (void)arg;
+    printf("    file bytes %6llu..%-6llu -> disk byte %-9llu ", (unsigned long long)e->logical,
+           (unsigned long long)(e->logical + e->length), (unsigned long long)e->physical);
+    if (e->flags & FIEMAP_EXTENT_INLINE) {
+        printf("(inline)\n");
+        return;
+    }
+    /* The extent item and back-references of the extent it points into. */
+    BtrfsKey lo = { e->extent_bytenr, 0, 0 }, hi = { e->extent_bytenr, 0xff, (uint64_t)-1 };
+    btrfs_tree_search(b, BTRFS_EXTENT_TREE_OBJECTID, &lo, &hi, show_ref, NULL);
+    printf("%s\n", e->flags & FIEMAP_EXTENT_SHARED ? "  SHARED" : "");
+}
+
 static void show(const char *path)
 {
     FsStat st;
     must(fs_stat(fs, path, &st), "stat");
-    printf("  %s: inode %u, %u bytes\n", path, st.ino, st.size);
-    for (uint32_t i = 0; i * BLOCK_SIZE < st.size; i++) {
-        uint32_t b;
-        must(fs_bmap(fs, path, i, 0, &b), "bmap");
-        uint32_t d = cowtree_get(vol_tree(vol), vol_live_root(vol), b);
-        printf("    file block %u -> fs block %-4u -> disk block #%-4u refs %u%s\n", i, b, d,
-               alloc_refcount(vol_allocator(vol), d),
-               alloc_refcount(vol_allocator(vol), d) > 1 ? "  shared" : "");
-    }
+    printf("  %s: inode %llu, %llu bytes\n", path, (unsigned long long)st.ino, (unsigned long long)st.size);
+    fs_fiemap(fs, path, show_extent, NULL);
 }
 
 static void footer(void)
 {
-    FsInfo in;
-    fs_info(fs, &in);
-    printf("disk blocks written: %llu   disk blocks in use: %u   free fs blocks: %u   "
-           "free inodes: %u   fsck: %s\n",
-           (unsigned long long)(disk_write_count(disk) - writes_before), vol_used_blocks(vol),
-           in.blocks_free, in.inodes_free, fs_check(fs) ? "PROBLEMS" : "clean");
+    BtrfsStats now;
+    FsSpace sp;
+    btrfs_commit(b);
+    btrfs_stats(b, &now);
+    fs_space(b, &sp);
+    printf("data sectors written: %llu   data in extents: %llu bytes   btrfs check: %s\n",
+           (unsigned long long)(now.data_sectors_written - before.data_sectors_written),
+           (unsigned long long)sp.data_used, btrfs_check(disk, 0) ? "PROBLEMS" : "clean");
 }
 
 int main(void)
 {
-    char text[500];
-
-    disk = mem_disk_create(2048);
-    vol = disk ? vol_create(disk) : NULL;
-    if (!vol || fs_format(vol) < 0 || !(fs = fs_open(vol)))
+    static char text[20000];
+    BtrfsMkfsOpts o = { 4096, NULL };
+    disk = mem_disk_create(16384);
+    if (!disk || btrfs_mkfs(disk, &o) < 0 || btrfs_mount(disk, NULL, &b) < 0 || !(fs = fs_open(b)))
         return 1;
     for (int i = 0; i < (int)sizeof text; i++)
-        text[i] = (char)('A' + i / (int)BLOCK_SIZE); /* block 0 = AAAA..., block 1 = BBBB..., ... */
+        text[i] = (char)('A' + i / (int)BLOCK_SIZE);
 
-    step("1. Write a 500-byte file (4 blocks)");
+    step("1. Write a 20000-byte file");
     must(fs_create(fs, "/report.txt"), "create");
-    must(fs_write(fs, "/report.txt", 0, text, sizeof text), "write");
-    show("/report.txt");
+    must((int)fs_write(fs, "/report.txt", 0, text, sizeof text), "write");
     footer();
+    show("/report.txt");
 
-    step("2. cp /report.txt /copy.txt  (dup_copy_file)");
+    step("2. cp --reflink /report.txt /copy.txt  (dup_copy_file)");
     must(dup_copy_file(fs, "/report.txt", "/copy.txt"), "copy");
+    footer();
     show("/report.txt");
     show("/copy.txt");
-    footer();
-    printf("-> the copy has its own inode and its own fs blocks, but every one points at\n"
-           "   the original's disk block (refs 2). No data was copied.\n");
+    printf("-> the copy has its own inode and EXTENT_DATA item pointing at the SAME extent:\n"
+           "   refs 2, one EXTENT_DATA_REF per file. No data was written.\n");
 
-    step("3. Update the copy: write \"xyz\" at byte 130 (file block 1)");
-    must(fs_write(fs, "/copy.txt", 130, "xyz", 3), "write");
+    step("3. Update the copy: write \"xyz\" at byte 5000");
+    must((int)fs_write(fs, "/copy.txt", 5000, "xyz", 3), "write");
+    footer();
     show("/report.txt");
     show("/copy.txt");
-    footer();
-    printf("-> only file block 1 of the copy got a new disk block; the rest stay shared.\n");
+    printf("-> the written sector went to a new extent; the copy's item was split around it\n"
+           "   (two items into the old extent: that is why its ref count is 2 there).\n");
 
     step("4. Delete the original");
     must(fs_unlink(fs, "/report.txt"), "unlink");
-    show("/copy.txt");
     footer();
-    printf("-> the copy keeps its data: a disk block is freed only at refs 0.\n");
+    show("/copy.txt");
+    printf("-> the old extent stays: the copy still references it.\n");
 
     fs_close(fs);
-    vol_destroy(vol);
+    btrfs_unmount(b);
     disk_close(disk);
     return 0;
 }

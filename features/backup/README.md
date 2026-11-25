@@ -2,34 +2,39 @@
 
 **Owner:** _[name]_
 
-This is modelled on `btrfs send` / `btrfs receive`. It turns the difference between
-two trees into a stream of changes, and applies that stream to another volume.
+This is modelled on `btrfs send` / `btrfs receive`. It turns the difference between two
+read-only snapshots into a stream of changes, and applies that stream to another
+filesystem.
 
-- **Full backup:** every page of a tree.
-- **Incremental backup:** only the pages that differ between a base tree and a newer
-  one. Sharing makes this cheap: if both trees point at the **same block number**
-  (a leaf or a data block), nothing below it changed, so skip it.
+- **Full backup:** every file of a snapshot.
+- **Incremental backup:** only what differs between a parent snapshot and a newer one.
+  Sharing makes this cheap: btrfs's `btrfs_compare_trees` walks both FS trees together.
+  When two node pointers name the **same block** (same bytenr and generation), nothing
+  below them changed, so it skips that subtree.
 
 ## Suggested files
 
 ```text
-include/backup.h         int backup_send(Volume *v, const char *base, const char *target, FILE *out);
-                         int backup_receive(Volume *v, FILE *in);
+include/backup.h    int backup_send(Btrfs *b, uint64_t parent_snap, uint64_t snap, FILE *out);
+                    int backup_receive(Fs *dst, const char *path, FILE *in);
 src/backup.c
 tests/test_backup.c
-demo/demo_backup.c       (optional)
+demo/demo_backup.c  (optional)
 ```
 
 ## Core API you will use
 
-- `vol_root_find(v, name, &root)` gets the base and target trees. They are usually
-  checkpoints: `ckpt_create` from `features/checkpoint`.
-- `cowtree_get(vol_tree(v), root, page)` compares block numbers page by page. Equal
-  numbers mean unchanged.
-- `vol_read_tree(v, root, page, buf, len)` reads the contents to send.
-- On receive, use `vol_write` / `vol_erase`, then `vol_root_add` to record the
-  received tree as the base for the next incremental.
+- Snapshots to send: `ckpt_create` (features/checkpoint) or `fs_subvol_snapshot(..., 1, &id)`.
+  Find the parent of an incremental send with `fs_subvol_info`: the `parent_uuid` and
+  `uuid` fields are what btrfs uses.
+- Reading a snapshot's items: `btrfs_tree_search(b, snap_id, &min, &max, fn, arg)` gives
+  every `INODE_ITEM`, `INODE_REF`, `DIR_INDEX` and `EXTENT_DATA` in key order. Compare two
+  snapshots key by key.
+- File contents: `fs_open_subvol(b, snap_id)` then `fs_read`.
+- On receive, use `fs_subvol_create`, then the normal file operations. Finish with
+  `fs_subvol_snapshot(..., 1, ...)` so the received copy is read-only, as btrfs receive
+  leaves it.
 
-To skip shared subtrees without reading every page, you may need a small new core
-function, such as `cowtree_leaf(root, i)`. Add it to `core/include/cowtree.h`, and
-run `make test` for all features.
+To skip shared subtrees without visiting every item, you need to see node pointers.
+Add a small core function, such as `btrfs_tree_walk(b, tree_id, fn)` reporting each
+block's bytenr and generation, to `fs.h`. Then run `make test` for all features.

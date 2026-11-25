@@ -1,72 +1,12 @@
 /*
- * test_fs.c - the filesystem: files, directories, the inode free list,
- * hard links, truncate, a full disk, and random operations checked
- * against a simple model with fsck (fs_check) after every step.
+ * test_fs.c - files and directories: create, write, read, links, inline
+ * and regular extents, truncate, holes, copy-on-write of data, checksums,
+ * a full disk, and random operations against a model, with btrfs check
+ * after every commit.
  */
 #include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-#include "fs.h"
-#include "mem_disk.h"
-#include "volume.h"
-
-#define CHECK(c)                                                                  \
-    do {                                                                          \
-        if (!(c)) {                                                               \
-            fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #c); \
-            exit(1);                                                              \
-        }                                                                         \
-    } while (0)
-
-static Disk *disk;
-static Volume *vol;
-static Fs *fs;
-
-static void setup(uint32_t blocks)
-{
-    disk = mem_disk_create(blocks);
-    vol = vol_create(disk);
-    CHECK(fs_open(vol) == NULL);        /* nothing formatted yet */
-    CHECK(fs_format(vol) == 0);
-    fs = fs_open(vol);
-    CHECK(fs != NULL);
-    CHECK(fs_check(fs) == 0);
-}
-
-static void teardown(void)
-{
-    CHECK(fs_check(fs) == 0);
-    CHECK(vol_check(vol) == 0);
-    fs_close(fs);
-    vol_destroy(vol);
-    disk_close(disk);
-}
-
-static int file_is(const char *path, const char *want)
-{
-    char buf[FS_MAX_FILE + 1];
-    int n = fs_read(fs, path, 0, buf, FS_MAX_FILE);
-    if (n < 0)
-        return 0;
-    buf[n] = '\0';
-    return strcmp(buf, want) == 0 && (size_t)n == strlen(want);
-}
-
-static int put(const char *path, const char *text)
-{
-    int r = fs_create(fs, path);
-    if (r < 0 && r != -EEXIST)
-        return r;
-    r = fs_truncate(fs, path, 0);
-    if (r < 0)
-        return r;
-    r = fs_write(fs, path, 0, text, (uint32_t)strlen(text));
-    return r < 0 ? r : 0;
-}
-
-/* ---------------------------------------------------------------- tests */
+#include "test_util.h"
 
 static int count;
 static void count_entry(void *arg, const char *name, const FsStat *st)
@@ -77,364 +17,369 @@ static void count_entry(void *arg, const char *name, const FsStat *st)
     count++;
 }
 
+typedef struct {
+    int n;
+    FsExtent e[64];
+} Extents;
+
+static void collect(void *arg, const FsExtent *e)
+{
+    Extents *x = arg;
+    if (x->n < 64)
+        x->e[x->n++] = *e;
+}
+
 static void test_basics(void)
 {
+    Disk *d = new_disk(8192);
+    Btrfs *b = mount_ok(d);
+    Fs *fs = fs_open(b);
     FsStat st;
 
-    setup(512);
-    CHECK(fs_stat(fs, "/", &st) == 0 && st.type == FS_DIR && st.ino == FS_ROOT_INO);
-    CHECK(st.nlink == 2);
-
+    CHECK(fs != NULL && fs_subvol_id(fs) == BTRFS_FS_TREE_OBJECTID);
+    CHECK(fs_stat(fs, "/", &st) == 0 && st.type == FS_DIR && st.ino == FS_ROOT_INO && st.nlink == 1);
     CHECK(fs_mkdir(fs, "/docs") == 0);
     CHECK(fs_create(fs, "/docs/notes.txt") == 0);
     CHECK(fs_write(fs, "/docs/notes.txt", 0, "hello", 5) == 5);
-    CHECK(file_is("/docs/notes.txt", "hello"));
-    CHECK(fs_write(fs, "/docs/notes.txt", 5, ", world", 7) == 7);   /* append */
-    CHECK(file_is("/docs/notes.txt", "hello, world"));
-    CHECK(fs_write(fs, "/docs/notes.txt", 0, "J", 1) == 1);         /* overwrite */
-    CHECK(file_is("/docs/notes.txt", "Jello, world"));
-
-    CHECK(fs_stat(fs, "/docs/notes.txt", &st) == 0);
-    CHECK(st.type == FS_FILE && st.size == 12 && st.nlink == 1 && st.blocks == 1);
-    CHECK(fs_stat(fs, "/docs", &st) == 0 && st.nlink == 2);
-    CHECK(fs_stat(fs, "/", &st) == 0 && st.nlink == 3);              /* /docs/.. */
-    CHECK(fs_stat(fs, "//docs//notes.txt", &st) == 0);              /* extra slashes */
+    CHECK(file_is(fs, "/docs/notes.txt", "hello"));
+    CHECK(fs_write(fs, "/docs/notes.txt", 5, ", world", 7) == 7);
+    CHECK(fs_write(fs, "/docs/notes.txt", 0, "J", 1) == 1);
+    CHECK(file_is(fs, "/docs/notes.txt", "Jello, world"));
+    CHECK(fs_stat(fs, "/docs/notes.txt", &st) == 0 && st.type == FS_FILE && st.size == 12 && st.nlink == 1);
+    CHECK(st.ino == 258); /* "/" is 256, /docs 257: highest + 1 */
+    CHECK(fs_stat(fs, "/docs", &st) == 0 && st.size == 2 * strlen("notes.txt") && st.nlink == 1);
+    CHECK(fs_stat(fs, "//docs//./notes.txt", &st) == 0);
+    CHECK(fs_stat(fs, "/docs/../docs/notes.txt", &st) == 0);
 
     count = 0;
-    CHECK(fs_readdir(fs, "/docs", count_entry, NULL) == 0);
-    CHECK(count == 3);                                               /* . .. notes.txt */
-
+    CHECK(fs_readdir(fs, "/docs", count_entry, NULL) == 0 && count == 3);
     CHECK(fs_create(fs, "/docs/notes.txt") == -EEXIST);
     CHECK(fs_create(fs, "/missing/x") == -ENOENT);
     CHECK(fs_create(fs, "/docs/notes.txt/x") == -ENOTDIR);
     CHECK(fs_create(fs, "relative") == -EINVAL);
     CHECK(fs_create(fs, "/") == -EINVAL);
-    CHECK(fs_create(fs, "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == -ENAMETOOLONG);
+    char longname[300];
+    memset(longname, 'a', sizeof longname);
+    longname[0] = '/';
+    longname[299] = '\0';
+    CHECK(fs_create(fs, longname) == -ENAMETOOLONG);
     CHECK(fs_read(fs, "/docs", 0, (char[8]){ 0 }, 8) == -EISDIR);
-    CHECK(fs_write(fs, "/docs", 0, "x", 1) == -EISDIR);
     CHECK(fs_unlink(fs, "/docs") == -EISDIR);
     CHECK(fs_rmdir(fs, "/docs") == -ENOTEMPTY);
     CHECK(fs_rmdir(fs, "/docs/notes.txt") == -ENOTDIR);
-    CHECK(fs_check(fs) == 0);
+    commit_and_check(b);
 
     CHECK(fs_unlink(fs, "/docs/notes.txt") == 0);
     CHECK(fs_stat(fs, "/docs/notes.txt", &st) == -ENOENT);
     CHECK(fs_rmdir(fs, "/docs") == 0);
-    CHECK(fs_stat(fs, "/", &st) == 0 && st.nlink == 2);
-    teardown();
+    commit_and_check(b);
+    fs_close(fs);
+    CHECK(btrfs_unmount(b) == 0);
+    disk_close(d);
     printf("ok   files and directories: create, write, read, stat, readdir, unlink, rmdir\n");
 }
 
-static void test_inode_free_list(void)
+static void test_links_and_names(void)
 {
+    Disk *d = new_disk(8192);
+    Btrfs *b = mount_ok(d);
+    Fs *fs = fs_open(b);
     FsStat st;
-    FsInfo info;
-    char path[32];
 
-    setup(1024);
-    CHECK(fs_info(fs, &info) == 0 && info.inodes_free == FS_INODES - 2);
-
-    CHECK(fs_create(fs, "/a") == 0);              /* the free list starts 2, 3, 4 ... */
-    CHECK(fs_stat(fs, "/a", &st) == 0 && st.ino == 2);
-    CHECK(fs_create(fs, "/b") == 0);
-    CHECK(fs_stat(fs, "/b", &st) == 0 && st.ino == 3);
-    CHECK(fs_unlink(fs, "/a") == 0);              /* inode 2 goes back on the front */
-    CHECK(fs_create(fs, "/c") == 0);
-    CHECK(fs_stat(fs, "/c", &st) == 0 && st.ino == 2); /* ... so it is reused first */
-    CHECK(fs_unlink(fs, "/b") == 0);
-    CHECK(fs_unlink(fs, "/c") == 0);
-
-    /* Use up every inode. A directory holds 46 names, so use two. */
-    int made = 0, r = 0;
-    CHECK(fs_mkdir(fs, "/d1") == 0);
-    CHECK(fs_mkdir(fs, "/d2") == 0);
-    made += 2;
-    for (int i = 0; r == 0; i++) {
-        snprintf(path, sizeof path, "/d%d/f%d", 1 + i % 2, i);
-        r = fs_create(fs, path);
-        if (r == 0)
-            made++;
-    }
-    CHECK(r == -ENOSPC);                          /* the free list is empty */
-    CHECK(made == FS_INODES - 2);
-    CHECK(fs_info(fs, &info) == 0 && info.inodes_free == 0);
-    CHECK(fs_mkdir(fs, "/e") == -ENOSPC);
-    CHECK(fs_check(fs) == 0);
-
-    CHECK(fs_unlink(fs, "/d1/f8") == 0);          /* free one ... */
-    CHECK(fs_create(fs, "/new") == 0);            /* ... and it is the one reused */
-    CHECK(fs_info(fs, &info) == 0 && info.inodes_free == 0);
-    teardown();
-    printf("ok   inodes: lowest free first, a freed inode is reused first, run out\n");
-}
-
-/* Bach's ialloc and ifree: the superblock's free inode list and the
- * remembered inode. */
-static int ino_of(const char *path)
-{
-    FsStat st;
-    return fs_stat(fs, path, &st) == 0 ? (int)st.ino : -1;
-}
-
-static void test_ialloc_ifree(void)
-{
-    FsInfo in;
-    char path[16];
-
-    setup(1024);
-    /* mkfs ran ialloc once for "/": the scan found inodes 1..8, handed out
-     * 1, and remembered 8. The next one out is the top of the list: 2. */
-    CHECK(fs_info(fs, &in) == 0);
-    CHECK(in.ninode == 7 && in.inode_list[6] == 2 && in.remembered_inode == 8);
-
-    for (int i = 2; i <= 8; i++) {                  /* use up the list: 2 .. 8 */
-        snprintf(path, sizeof path, "/f%d", i);
-        CHECK(fs_create(fs, path) == 0 && ino_of(path) == i);
-    }
-    CHECK(fs_info(fs, &in) == 0 && in.ninode == 0);
-
-    CHECK(fs_create(fs, "/f9") == 0);               /* list empty: scan from 8 */
-    CHECK(ino_of("/f9") == 9);
-    CHECK(fs_info(fs, &in) == 0 && in.ninode == 7 && in.remembered_inode == 16);
-
-    CHECK(fs_unlink(fs, "/f3") == 0);               /* list not full: 3 goes in */
-    CHECK(fs_info(fs, &in) == 0 && in.ninode == 8 && in.inode_list[7] == 3);
-    CHECK(fs_unlink(fs, "/f4") == 0);               /* list full: remember 4 instead */
-    CHECK(fs_info(fs, &in) == 0 && in.ninode == 8 && in.remembered_inode == 4);
-    CHECK(fs_check(fs) == 0);
-
-    CHECK(fs_create(fs, "/a") == 0 && ino_of("/a") == 3); /* from the list */
-    for (int i = 10; i <= 16; i++) {                      /* the rest: 10 .. 16 */
-        snprintf(path, sizeof path, "/g%d", i);
-        CHECK(fs_create(fs, path) == 0 && ino_of(path) == i);
-    }
-    CHECK(fs_create(fs, "/b") == 0);                /* empty again: scan from 4 ... */
-    CHECK(ino_of("/b") == 4);                       /* ... and 4 is found first */
-    CHECK(fs_info(fs, &in) == 0 && in.remembered_inode == 23); /* 4, 17 .. 23 */
-    teardown();
-    printf("ok   ialloc / ifree: free inode list, scan from the remembered inode\n");
-}
-
-/* Bach's alloc and free: the chained free block list. */
-static void test_alloc_free(void)
-{
-    FsInfo in, start;
-    FsStat st;
-    char data[FS_MAX_FILE];
-    uint32_t bno[FS_DIRECT];
-
-    memset(data, 'x', sizeof data);
-    setup(1024);
-    CHECK(fs_info(fs, &start) == 0);
-    CHECK(start.blocks_free == start.blocks_total - 1);  /* "/" uses one block */
-    uint32_t k = start.nfree;                            /* entries in the list now */
-    uint32_t next = start.free_list[k - 1], link = start.free_list[0];
-    CHECK(k >= 2 && link != 0);
-
-    /* alloc hands out the top of the list first. */
-    CHECK(fs_create(fs, "/one") == 0);
-    CHECK(fs_write(fs, "/one", 0, data, 1) == 1);
-    CHECK(fs_bmap(fs, "/one", 0, 0, &bno[0]) == 0 && bno[0] == next);
-    CHECK(fs_info(fs, &in) == 0 && in.nfree == k - 1);
-
-    /* Take every block left in the list: the last one taken is free[0],
-     * the block holding the next part of the list, which is copied into
-     * the superblock. */
-    CHECK(fs_create(fs, "/many") == 0);
-    CHECK(fs_write(fs, "/many", 0, data, (k - 1) * BLOCK_SIZE) == (int)((k - 1) * BLOCK_SIZE));
-    CHECK(fs_bmap(fs, "/many", k - 2, 0, &bno[1]) == 0 && bno[1] == link);
-    CHECK(fs_info(fs, &in) == 0 && in.nfree == FS_NICFREE); /* refilled from the link block */
-    CHECK(in.blocks_free == start.blocks_free - k);
-    CHECK(fs_check(fs) == 0);
-
-    /* free: with the list full, the first block freed stores the list and
-     * becomes free[0] of a new list. */
-    CHECK(fs_stat(fs, "/many", &st) == 0);
-    uint32_t first;
-    CHECK(fs_bmap(fs, "/many", 0, 0, &first) == 0);
-    CHECK(fs_unlink(fs, "/many") == 0);
-    CHECK(fs_info(fs, &in) == 0 && in.free_list[0] == first && in.nfree == k - 1);
-    CHECK(fs_unlink(fs, "/one") == 0);
-    CHECK(fs_info(fs, &in) == 0 && in.blocks_free == start.blocks_free);
-    CHECK(in.free_list[in.nfree - 1] == next);           /* last freed = next out */
-    teardown();
-    printf("ok   alloc / free: chained free block list, refill and spill\n");
-}
-
-static void test_links(void)
-{
-    FsStat st;
-    FsInfo before, after;
-
-    setup(512);
-    CHECK(put("/orig", "shared text") == 0);
+    CHECK(put(fs, "/orig", "shared text") == 0);
     CHECK(fs_mkdir(fs, "/dir") == 0);
-    CHECK(fs_info(fs, &before) == 0);
-    CHECK(fs_link(fs, "/orig", "/dir/alias") == 0);  /* a second name, same inode */
-    CHECK(fs_stat(fs, "/orig", &st) == 0 && st.nlink == 2);
-    CHECK(file_is("/dir/alias", "shared text"));
-    CHECK(fs_write(fs, "/dir/alias", 0, "S", 1) == 1); /* both names see the change */
-    CHECK(file_is("/orig", "Shared text"));
-    CHECK(fs_link(fs, "/orig", "/dir/alias") == -EEXIST);
-    CHECK(fs_link(fs, "/dir", "/dir2") == -EPERM);     /* no links to directories */
-    CHECK(fs_check(fs) == 0);
-
-    CHECK(fs_unlink(fs, "/orig") == 0);              /* the data stays: one link left */
-    CHECK(file_is("/dir/alias", "Shared text"));
+    CHECK(fs_link(fs, "/orig", "/dir/alias") == 0);
+    CHECK(fs_link(fs, "/orig", "/alias2") == 0); /* two names in "/": one INODE_REF item, two entries */
+    CHECK(fs_stat(fs, "/orig", &st) == 0 && st.nlink == 3);
+    CHECK(fs_write(fs, "/dir/alias", 0, "S", 1) == 1);
+    CHECK(file_is(fs, "/orig", "Shared text"));
+    CHECK(fs_link(fs, "/dir", "/dir2") == -EPERM);
+    commit_and_check(b);
+    CHECK(fs_unlink(fs, "/orig") == 0);
+    CHECK(fs_unlink(fs, "/alias2") == 0);
+    CHECK(file_is(fs, "/dir/alias", "Shared text"));
     CHECK(fs_stat(fs, "/dir/alias", &st) == 0 && st.nlink == 1);
-    CHECK(fs_unlink(fs, "/dir/alias") == 0);         /* last link: inode and page freed */
-    CHECK(fs_info(fs, &after) == 0);
-    CHECK(after.inodes_free == before.inodes_free + 1);
-    CHECK(after.blocks_free == before.blocks_free + 1);
-    teardown();
-    printf("ok   hard links: nlink counts, data freed with the last link\n");
+    commit_and_check(b);
+
+    /* Many names in one directory: the directory's items split across
+     * leaves; every name stays findable. */
+    char p[64];
+    for (int i = 0; i < 600; i++) {
+        snprintf(p, sizeof p, "/dir/entry-%04d", i);
+        CHECK(fs_create(fs, p) == 0);
+    }
+    commit_and_check(b);
+    count = 0;
+    CHECK(fs_readdir(fs, "/dir", count_entry, NULL) == 0 && count == 603);
+    for (int i = 0; i < 600; i += 2) {
+        snprintf(p, sizeof p, "/dir/entry-%04d", i);
+        CHECK(fs_unlink(fs, p) == 0);
+    }
+    for (int i = 1; i < 600; i += 2) {
+        snprintf(p, sizeof p, "/dir/entry-%04d", i);
+        CHECK(fs_stat(fs, p, &st) == 0);
+    }
+    commit_and_check(b);
+    fs_close(fs);
+    CHECK(btrfs_unmount(b) == 0);
+    disk_close(d);
+    printf("ok   hard links, two names in one directory, 600 entries in one directory\n");
 }
 
-static void test_sizes(void)
+static void test_extents(void)
 {
-    const int MAX = (int)FS_MAX_FILE;
-    char big[FS_MAX_FILE], back[FS_MAX_FILE];
+    Disk *d = new_disk(8192);
+    Btrfs *b = mount_ok(d);
+    Fs *fs = fs_open(b);
     FsStat st;
+    Extents x;
+    static char big[300000], back[300000];
 
-    setup(512);
-    for (int i = 0; i < MAX; i++)
+    for (size_t i = 0; i < sizeof big; i++)
         big[i] = (char)('a' + i % 26);
+
+    /* Up to 2048 bytes: inline, in the FS tree. */
+    CHECK(fs_create(fs, "/small") == 0);
+    CHECK(fs_write(fs, "/small", 0, big, 2000) == 2000);
+    x.n = 0;
+    CHECK(fs_fiemap(fs, "/small", collect, &x) == 0);
+    CHECK(x.n == 1 && (x.e[0].flags & FIEMAP_EXTENT_INLINE) && x.e[0].length == 2000);
+    CHECK(fs_stat(fs, "/small", &st) == 0 && st.nbytes == 2000);
+    /* Past 2048 it becomes a regular extent. */
+    CHECK(fs_write(fs, "/small", 2000, big + 2000, 100) == 100);
+    x.n = 0;
+    CHECK(fs_fiemap(fs, "/small", collect, &x) == 0);
+    CHECK(x.n == 1 && !(x.e[0].flags & FIEMAP_EXTENT_INLINE) && x.e[0].physical != 0);
+    CHECK(fs_read(fs, "/small", 0, back, 3000) == 2100 && memcmp(back, big, 2100) == 0);
+
+    /* A big file; an overwrite in the middle goes to a NEW extent and
+     * splits the old item in two (__btrfs_drop_extents). */
     CHECK(fs_create(fs, "/big") == 0);
-    CHECK(fs_write(fs, "/big", 0, big, FS_MAX_FILE) == MAX);      /* all 12 pages */
-    CHECK(fs_read(fs, "/big", 0, back, FS_MAX_FILE) == MAX);
-    CHECK(memcmp(big, back, FS_MAX_FILE) == 0);
-    CHECK(fs_write(fs, "/big", FS_MAX_FILE, "x", 1) == -EFBIG);
-    CHECK(fs_read(fs, "/big", FS_MAX_FILE, back, 10) == 0);          /* end of file */
+    CHECK(fs_write(fs, "/big", 0, big, sizeof big) == (int64_t)sizeof big);
+    x.n = 0;
+    CHECK(fs_fiemap(fs, "/big", collect, &x) == 0);
+    uint64_t first = x.e[0].physical;
+    commit_and_check(b);
+    CHECK(fs_write(fs, "/big", 8192, "XXXX", 4) == 4);
+    big[8192] = big[8193] = big[8194] = big[8195] = 'X';
+    x.n = 0;
+    CHECK(fs_fiemap(fs, "/big", collect, &x) == 0);
+    CHECK(x.n == 3 && x.e[0].physical == first && x.e[0].length == 8192);
+    CHECK(x.e[1].logical == 8192 && x.e[1].length == 4096 && x.e[1].physical != first + 8192);
+    CHECK(x.e[2].physical == first + 12288); /* the tail still points into the old extent */
+    CHECK(fs_read(fs, "/big", 0, back, sizeof back) == (int64_t)sizeof big && memcmp(back, big, sizeof big) == 0);
+    commit_and_check(b);
 
-    CHECK(fs_truncate(fs, "/big", 200) == 0);    /* frees pages 2..11 */
-    CHECK(fs_stat(fs, "/big", &st) == 0 && st.size == 200 && st.blocks == 2);
-    CHECK(fs_truncate(fs, "/big", 300) == 0);    /* grow: the new part reads as zeros */
-    CHECK(fs_read(fs, "/big", 0, back, 300) == 300);
-    CHECK(memcmp(back, big, 200) == 0);
-    for (int i = 200; i < 300; i++)
+    /* Truncate down, then grow: the grown part reads as zeros. */
+    CHECK(fs_truncate(fs, "/big", 5000) == 0);
+    CHECK(fs_truncate(fs, "/big", 20000) == 0);
+    CHECK(fs_read(fs, "/big", 0, back, 20000) == 20000 && memcmp(back, big, 5000) == 0);
+    for (int i = 5000; i < 20000; i++)
         CHECK(back[i] == 0);
+    CHECK(fs_stat(fs, "/big", &st) == 0 && st.size == 20000 && st.nbytes == 8192);
 
-    CHECK(fs_create(fs, "/sparse") == 0);        /* a gap before the data */
-    CHECK(fs_write(fs, "/sparse", 1000, "end", 3) == 3);
-    CHECK(fs_stat(fs, "/sparse", &st) == 0 && st.size == 1003 && st.blocks == 1);
-    CHECK(fs_read(fs, "/sparse", 0, back, 1003) == 1003);
-    CHECK(back[0] == 0 && back[999] == 0 && memcmp(back + 1000, "end", 3) == 0);
-    teardown();
-    printf("ok   file sizes: 12 direct blocks, truncate, gaps read as zeros\n");
+    /* A hole: nothing is stored for it (NO_HOLES). */
+    CHECK(fs_create(fs, "/sparse") == 0);
+    CHECK(fs_write(fs, "/sparse", 1000000, "end", 3) == 3);
+    CHECK(fs_stat(fs, "/sparse", &st) == 0 && st.size == 1000003 && st.nbytes == 4096);
+    CHECK(fs_read(fs, "/sparse", 999990, back, 100) == 13 && back[0] == 0 && memcmp(back + 10, "end", 3) == 0);
+    commit_and_check(b);
+    fs_close(fs);
+    CHECK(btrfs_unmount(b) == 0);
+
+    /* Remount: the same data, from the disk. */
+    b = mount_ok(d);
+    fs = fs_open(b);
+    CHECK(fs_read(fs, "/small", 0, back, 3000) == 2100 && memcmp(back, big, 2100) == 0);
+    CHECK(fs_read(fs, "/big", 0, back, 5000) == 5000 && memcmp(back, big, 5000) == 0);
+    fs_close(fs);
+    CHECK(btrfs_unmount(b) == 0);
+    disk_close(d);
+    printf("ok   extents: inline up to 2048 bytes, copy-on-write overwrite splits items, truncate, holes\n");
 }
 
-static void test_full_disk_is_atomic(void)
+static void test_checksums(void)
 {
-    char data[FS_MAX_FILE];
-    char path[32];
-    FsInfo info;
-    int r = 0, files = 0;
+    Disk *d = new_disk(8192);
+    Btrfs *b = mount_ok(d);
+    Fs *fs = fs_open(b);
+    Extents x = { 0 };
+    char buf[10000];
+    uint8_t sec[BLOCK_SIZE];
+
+    memset(buf, 'q', sizeof buf);
+    CHECK(fs_create(fs, "/f") == 0);
+    CHECK(fs_write(fs, "/f", 0, buf, sizeof buf) == (int64_t)sizeof buf);
+    CHECK(fs_fiemap(fs, "/f", collect, &x) == 0 && x.n == 1);
+    fs_close(fs);
+    CHECK(btrfs_unmount(b) == 0);
+
+    /* Damage one byte of the data on the disk. */
+    uint32_t s = (uint32_t)(x.e[0].physical / BLOCK_SIZE) + 1;
+    CHECK(disk_read(d, s, sec) == 0);
+    sec[7] ^= 0xff;
+    CHECK(disk_write(d, s, sec) == 0);
+
+    CHECK(btrfs_check(d, 0) == 1); /* the scrub finds it */
+    b = mount_ok(d);
+    fs = fs_open(b);
+    CHECK(fs_read(fs, "/f", 0, buf, 4096) == 4096);       /* sector 0 is fine */
+    CHECK(fs_read(fs, "/f", 4096, buf, 10) == -EIO);       /* sector 1 is not  */
+    fs_close(fs);
+    btrfs_crash(b);
+    disk_close(d);
+    printf("ok   data checksums: a damaged sector reads as -EIO, btrfs check reports it\n");
+}
+
+static void test_full_disk(void)
+{
+    Disk *d = new_disk(2048); /* 8 MiB */
+    Btrfs *b = mount_ok(d);
+    Fs *fs = fs_open(b);
+    static char data[200000];
+    char p[32];
+    int files = 0;
+    int64_t r = 0;
 
     memset(data, 'z', sizeof data);
-    setup(300); /* a small disk */
-    CHECK(fs_mkdir(fs, "/d") == 0);
     for (int i = 0; r >= 0; i++) {
-        snprintf(path, sizeof path, "/d/f%d", i);
-        r = fs_create(fs, path);
-        if (r == 0) {
-            r = fs_write(fs, path, 0, data, sizeof data);
-            if (r >= 0)
-                files++;
-            else
-                CHECK(fs_stat(fs, path, &(FsStat){ 0 }) == 0); /* create stayed, write undone */
+        snprintf(p, sizeof p, "/f%d", i);
+        int c = fs_create(fs, p);
+        if (c < 0) {
+            r = c;
+            break;
         }
-        CHECK(fs_check(fs) == 0);
-        CHECK(vol_check(vol) == 0);
+        r = fs_write(fs, p, 0, data, sizeof data);
+        if (r >= 0)
+            files++;
     }
     CHECK(r == -ENOSPC);
-    CHECK(files > 0);
-    CHECK(fs_info(fs, &info) == 0);
-    teardown();
-    printf("ok   a full disk fails cleanly: each operation is all or nothing (%d files fit)\n", files);
+    CHECK(!btrfs_is_read_only(b)); /* refused before changing anything: no abort */
+    commit_and_check(b);
+    /* Deleting works on a full disk, and the space comes back. */
+    for (int i = 0; i < files; i += 2) {
+        snprintf(p, sizeof p, "/f%d", i);
+        CHECK(fs_unlink(fs, p) == 0);
+    }
+    commit_and_check(b);
+    CHECK(fs_create(fs, "/again") == 0);
+    CHECK(fs_write(fs, "/again", 0, data, sizeof data) == (int64_t)sizeof data);
+    commit_and_check(b);
+    fs_close(fs);
+    CHECK(btrfs_unmount(b) == 0);
+    disk_close(d);
+    printf("ok   a full disk refuses with -ENOSPC and stays consistent; deleting frees space (%d files fit)\n",
+           files);
 }
 
-/* Random operations on a few names, compared with a model in memory. */
-#define NAMES 8
-static const char *names[NAMES] = { "/a", "/b", "/c", "/d/a", "/d/b", "/d/e/x", "/f", "/d/e/y" };
-
+/* Random operations on a few files, against a model. */
+#define NF 10
+#define MAXF 70000
 typedef struct {
     int exists;
-    uint32_t len;
-    char data[FS_MAX_FILE];
+    uint64_t len;
+    unsigned char data[MAXF];
 } ModelFile;
 
 static void test_random(void)
 {
-    static ModelFile model[NAMES];
-    char buf[FS_MAX_FILE];
-    int ops = 0;
+    static ModelFile live[NF], committed[NF];
+    static unsigned char buf[MAXF + 16];
+    Disk *d = new_disk(16384);
+    Btrfs *b = mount_ok(d);
+    Fs *fs = fs_open(b);
+    char p[32], q[32];
+    int checks = 0;
 
-    setup(2048);
     CHECK(fs_mkdir(fs, "/d") == 0);
-    CHECK(fs_mkdir(fs, "/d/e") == 0);
-    memset(model, 0, sizeof model);
+    commit_and_check(b);
+    memcpy(committed, live, sizeof live);
     srand(5);
-    for (int step = 0; step < 4000; step++) {
-        int k = rand() % NAMES, op = rand() % 6;
-        ModelFile *m = &model[k];
-        if (op == 0) {                                     /* create */
-            int r = fs_create(fs, names[k]);
-            CHECK(r == (m->exists ? -EEXIST : 0));
+    for (int step = 0; step < 6000; step++) {
+        int i = rand() % NF, j = rand() % NF, op = rand() % 20;
+        snprintf(p, sizeof p, i % 2 ? "/d/f%d" : "/f%d", i);
+        snprintf(q, sizeof q, j % 2 ? "/d/f%d" : "/f%d", j);
+        ModelFile *m = &live[i];
+        if (op < 2) {
+            CHECK(fs_create(fs, p) == (m->exists ? -EEXIST : 0));
             if (!m->exists) {
                 m->exists = 1;
                 m->len = 0;
             }
-        } else if (op <= 2) {                              /* write at an offset */
-            uint32_t off = (uint32_t)(rand() % 1400), n = (uint32_t)(rand() % 130 + 1);
-            for (uint32_t i = 0; i < n; i++)
-                buf[i] = (char)('A' + (step + (int)i) % 26);
-            int r = fs_write(fs, names[k], off, buf, n);
+        } else if (op < 9) {
+            uint64_t off = (uint64_t)(rand() % 2 ? rand() % 3000 : rand() % 60000);
+            uint64_t n = (uint64_t)(rand() % 2 ? rand() % 200 + 1 : rand() % 9000 + 1);
+            for (uint64_t k = 0; k < n; k++)
+                buf[k] = (unsigned char)rand();
+            int64_t r = fs_write(fs, p, off, buf, n);
             if (!m->exists) {
                 CHECK(r == -ENOENT);
             } else {
-                CHECK(r == (int)n);
+                CHECK(r == (int64_t)n);
                 if (off > m->len)
                     memset(m->data + m->len, 0, off - m->len);
                 memcpy(m->data + off, buf, n);
                 if (off + n > m->len)
                     m->len = off + n;
             }
-        } else if (op == 3) {                              /* truncate */
-            uint32_t size = (uint32_t)(rand() % 1500);
-            int r = fs_truncate(fs, names[k], size);
-            CHECK(r == (m->exists ? 0 : -ENOENT));
+        } else if (op < 11) {
+            uint64_t size = (uint64_t)(rand() % 2 ? rand() % 3000 : rand() % 65000);
+            CHECK(fs_truncate(fs, p, size) == (m->exists ? 0 : -ENOENT));
             if (m->exists) {
                 if (size > m->len)
                     memset(m->data + m->len, 0, size - m->len);
                 m->len = size;
             }
-        } else if (op == 4) {                              /* unlink */
-            CHECK(fs_unlink(fs, names[k]) == (m->exists ? 0 : -ENOENT));
+        } else if (op < 12) {
+            CHECK(fs_unlink(fs, p) == (m->exists ? 0 : -ENOENT));
             m->exists = 0;
-        } else {                                           /* read and compare */
-            int r = fs_read(fs, names[k], 0, buf, FS_MAX_FILE);
+        } else if (op < 14) {
+            /* Reflink the whole file (the duplication feature's core call). */
+            ModelFile *g = &live[j];
+            if (!m->exists || i == j)
+                continue;
+            if (!g->exists) {
+                CHECK(fs_create(fs, q) == 0);
+                g->exists = 1;
+            }
+            CHECK(fs_truncate(fs, q, 0) == 0);
+            CHECK(fs_clone_range(fs, p, 0, q, 0, 0) == 0);
+            g->len = m->len;
+            memcpy(g->data, m->data, m->len);
+        } else if (op < 17) {
+            int64_t r = fs_read(fs, p, 0, buf, MAXF + 16);
             if (!m->exists)
                 CHECK(r == -ENOENT);
             else
-                CHECK(r == (int)m->len && memcmp(buf, m->data, m->len) == 0);
+                CHECK(r == (int64_t)m->len && memcmp(buf, m->data, m->len) == 0);
+        } else if (op < 19) {
+            commit_and_check(b);
+            checks++;
+            memcpy(committed, live, sizeof live);
+        } else {
+            /* A crash: back to the last commit. */
+            fs_close(fs);
+            btrfs_crash(b);
+            CHECK(btrfs_check(d, 1) == 0);
+            b = mount_ok(d);
+            fs = fs_open(b);
+            memcpy(live, committed, sizeof live);
         }
-        ops++;
-        CHECK(fs_check(fs) == 0);  /* fsck after every step */
-        CHECK(vol_check(vol) == 0);
     }
-    teardown();
-    printf("ok   %d random creates, writes, truncates, unlinks and reads, fsck after each\n", ops);
+    fs_close(fs);
+    CHECK(btrfs_unmount(b) == 0);
+    CHECK(btrfs_check(d, 1) == 0);
+    disk_close(d);
+    printf("ok   6000 random writes, truncates, unlinks, reflinks and crashes; %d commits, each checked\n", checks);
 }
 
 int main(void)
 {
     test_basics();
-    test_inode_free_list();
-    test_ialloc_ifree();
-    test_alloc_free();
-    test_links();
-    test_sizes();
-    test_full_disk_is_atomic();
+    test_links_and_names();
+    test_extents();
+    test_checksums();
+    test_full_disk();
     test_random();
     printf("fs: all tests passed\n");
     return 0;

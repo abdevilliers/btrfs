@@ -1,5 +1,5 @@
 # A sample session:  build/bin/fsh demo.img < tools/demo_session.txt
-sb
+subvol list
 mkdir /docs
 write /docs/report.txt first draft
 ls /docs
@@ -10,15 +10,16 @@ snap tuesday
 write /docs/report.txt final version
 mkdir /docs/old
 cp /docs/report.txt /docs/old/copy.txt
+fiemap /docs/report.txt
 ls /docs
 snaps
 catsnap monday /docs/report.txt
 back 2
 cat /docs/report.txt
-ls /docs
+subvol list
 df
-sb
-fsck
 commit
+check
+dump-tree 2
 write /docs/report.txt not committed
 crash

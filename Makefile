@@ -1,4 +1,4 @@
-# btrfs - a btrfs-style copy-on-write storage project.
+# btrfs - a model of the btrfs filesystem, in C.
 #
 #   make            build every library, test and demo into build/
 #   make test       run core tests, then every feature's tests
@@ -33,6 +33,8 @@ TESTS    := $(addprefix $(BUILD)/bin/,$(basename $(notdir $(TEST_SRC))))
 DEMOS    := $(addprefix $(BUILD)/bin/,$(basename $(notdir $(DEMO_SRC))))
 TOOLS    := $(addprefix $(BUILD)/bin/,$(basename $(notdir $(TOOL_SRC))))
 
+CORE_TESTS := $(addprefix $(BUILD)/bin/,$(basename $(notdir $(wildcard core/tests/*.c))))
+
 vpath %.c $(sort $(dir $(TEST_SRC) $(DEMO_SRC) $(TOOL_SRC)))
 
 all: $(LIB) $(TESTS) $(DEMOS) $(TOOLS)
@@ -50,6 +52,11 @@ $(BUILD)/features/%.o: features/%.c $(HEADERS)
 $(LIB): $(OBJS)
 	@mkdir -p $(dir $@)
 	ar rcs $@ $^
+
+# Core tests may also look inside (core/src/ctree.h): they test the B-tree directly.
+$(CORE_TESTS): $(BUILD)/bin/%: core/tests/%.c $(LIB) $(HEADERS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(INCLUDES) -Icore/src $< $(LIB) -o $@
 
 $(BUILD)/bin/%: %.c $(LIB) $(HEADERS)
 	@mkdir -p $(dir $@)

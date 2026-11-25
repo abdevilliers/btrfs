@@ -1,9 +1,8 @@
 /*
- * checkpoint.c - create, read, rollback and delete checkpoints; go back x
- * checkpoints; take checkpoints at fixed times.
- *
- * Every function here only moves root pointers; the reference counting
- * and copy-on-write happen in core. None of them copies a page or a node.
+ * checkpoint.c - checkpoints as read-only snapshots, rollback as a
+ * writable snapshot made the default subvolume. Nothing here copies data
+ * or walks a tree: the core's snapshot (one copied root block) and
+ * copy-on-write do it all.
  */
 #include <errno.h>
 #include <stdio.h>
@@ -12,74 +11,219 @@
 
 #include "checkpoint.h"
 
-/* ------------------------------------------------------------ by name */
-
-int ckpt_create(Volume *v, const char *name)
+static Fs *top(Btrfs *b)
 {
-    /* A new root-table entry pointing at the live tree; the live root
-     * gains one reference. That is the whole checkpoint. */
-    return vol_root_add(v, name, vol_live_root(v));
+    return fs_open_subvol(b, BTRFS_FS_TREE_OBJECTID);
 }
 
-int ckpt_read(Volume *v, const char *name, uint32_t page, char *buf, size_t len)
+static int valid_name(const char *name)
 {
-    uint32_t root;
-    int r = vol_root_find(v, name, &root);
-    return r ? r : vol_read_tree(v, root, page, buf, len);
+    return name && *name && strlen(name) <= CKPT_NAME_MAX && !strchr(name, '/') && strcmp(name, ".") &&
+           strcmp(name, "..");
 }
 
-int ckpt_rollback(Volume *v, const char *name)
+static void ckpt_path(char *out, size_t n, const char *name)
 {
-    uint32_t root;
-    int r = vol_root_find(v, name, &root);
-    if (r)
+    snprintf(out, n, "%s/%s", CKPT_DIR, name);
+}
+
+int ckpt_setup(Btrfs *b)
+{
+    Fs *t = top(b);
+    FsStat st;
+    uint64_t id;
+    int r;
+    if (!t)
+        return -EIO;
+    if (fs_stat(t, CKPT_DIR, &st) == -ENOENT && (r = fs_mkdir(t, CKPT_DIR)) < 0)
+        goto out;
+    r = 0;
+    if (fs_get_default_subvol(b) == BTRFS_FS_TREE_OBJECTID) {
+        if (fs_stat(t, "/@", &st) == -ENOENT && (r = fs_subvol_create(t, "/@")) < 0)
+            goto out;
+        if ((r = fs_subvol_lookup(t, "/@", &id)) == 0)
+            r = fs_set_default_subvol(b, id);
+    }
+    if (r == 0)
+        r = btrfs_commit(b);
+out:
+    fs_close(t);
+    return r;
+}
+
+/* The live subvolume's path in the top level ("/@", "/@1", ...). */
+static int live_path(Btrfs *b, char *out, size_t n)
+{
+    FsSubvolInfo info;
+    uint64_t live = fs_get_default_subvol(b);
+    if (live == BTRFS_FS_TREE_OBJECTID)
+        return -EINVAL; /* ckpt_setup was not run */
+    int r = fs_subvol_info(b, live, &info);
+    if (r < 0)
         return r;
-    /* The live volume takes the checkpoint's tree and lets go of its own;
-     * blocks that only the old live tree used are freed. */
-    vol_set_live_root(v, root);
+    if (info.parent_id != BTRFS_FS_TREE_OBJECTID || info.dirid != FS_ROOT_INO)
+        return -EINVAL;
+    snprintf(out, n, "/%s", info.name);
     return 0;
 }
 
-int ckpt_delete(Volume *v, const char *name)
+int ckpt_create(Btrfs *b, const char *name)
 {
-    /* Drop the entry's reference: frees exactly what only it used. */
-    return vol_root_remove(v, name);
-}
-
-Fs *ckpt_open_fs(Volume *v, const char *name)
-{
-    uint32_t root;
-    return vol_root_find(v, name, &root) == 0 ? fs_open_tree(v, root) : NULL;
-}
-
-/* -------------------------------------------------------- by position */
-
-int ckpt_rollback_back(Volume *v, uint32_t x)
-{
-    char name[CKPT_NAME_MAX + 1];
-    uint32_t root;
-    /* The root table remembers the order entries were added in, so the
-     * x-th newest checkpoint is one lookup. The rest is a normal rollback. */
-    int r = vol_root_nth(v, x, name, &root);
-    if (r)
+    char src[FS_NAME_MAX + 2], dst[FS_NAME_MAX + 32];
+    if (!valid_name(name))
+        return -EINVAL;
+    int r = live_path(b, src, sizeof src);
+    if (r < 0)
         return r;
-    vol_set_live_root(v, root);
-    return 0;
+    Fs *t = top(b);
+    if (!t)
+        return -EIO;
+    ckpt_path(dst, sizeof dst, name);
+    r = fs_subvol_snapshot(t, src, dst, 1, NULL);
+    fs_close(t);
+    return r;
 }
 
-int ckpt_name_back(Volume *v, uint32_t x, char *name)
+/* ---------------------------------------------- the list, newest first */
+
+typedef struct {
+    uint64_t dir_ino;
+    FsSubvolInfo *list;
+    size_t n, cap;
+} List;
+
+static void collect(void *arg, const FsSubvolInfo *info)
 {
-    uint32_t root;
-    return vol_root_nth(v, x, name, &root);
+    List *l = arg;
+    if (info->parent_id != BTRFS_FS_TREE_OBJECTID || info->dirid != l->dir_ino)
+        return;
+    if (l->n == l->cap) {
+        size_t nc = l->cap ? l->cap * 2 : 16;
+        FsSubvolInfo *nl = realloc(l->list, nc * sizeof *nl);
+        if (!nl)
+            return;
+        l->list = nl;
+        l->cap = nc;
+    }
+    l->list[l->n++] = *info;
 }
 
-uint32_t ckpt_count(Volume *v)
+static int newest_first(const void *a, const void *b)
 {
-    char name[CKPT_NAME_MAX + 1];
-    uint32_t n = 0;
-    while (ckpt_name_back(v, n + 1, name) == 0)
-        n++;
+    const FsSubvolInfo *x = a, *y = b;
+    if (x->otransid != y->otransid)
+        return x->otransid > y->otransid ? -1 : 1;
+    return x->id > y->id ? -1 : x->id < y->id;
+}
+
+static int list_checkpoints(Btrfs *b, List *l)
+{
+    FsStat st;
+    Fs *t = top(b);
+    memset(l, 0, sizeof *l);
+    if (!t)
+        return -EIO;
+    int r = fs_stat(t, CKPT_DIR, &st);
+    fs_close(t);
+    if (r < 0)
+        return r == -ENOENT ? 0 : r;
+    l->dir_ino = st.ino;
+    r = fs_subvol_list(b, collect, l);
+    qsort(l->list, l->n, sizeof *l->list, newest_first);
+    return r;
+}
+
+int ckpt_name_back(Btrfs *b, uint32_t x, char *name)
+{
+    List l;
+    int r = list_checkpoints(b, &l);
+    if (r == 0 && (x == 0 || x > l.n))
+        r = -ENOENT;
+    if (r == 0)
+        strcpy(name, l.list[x - 1].name);
+    free(l.list);
+    return r;
+}
+
+uint32_t ckpt_count(Btrfs *b)
+{
+    List l;
+    uint32_t n = list_checkpoints(b, &l) == 0 ? (uint32_t)l.n : 0;
+    free(l.list);
     return n;
+}
+
+/* ---------------------------------------------------- rollback, delete */
+
+int ckpt_rollback(Btrfs *b, const char *name)
+{
+    char src[FS_NAME_MAX + 32], old[FS_NAME_MAX + 2], fresh[32];
+    FsStat st;
+    uint64_t id, old_id = fs_get_default_subvol(b);
+    if (!valid_name(name))
+        return -EINVAL;
+    int r = live_path(b, old, sizeof old);
+    if (r < 0)
+        return r;
+    Fs *t = top(b);
+    if (!t)
+        return -EIO;
+    ckpt_path(src, sizeof src, name);
+    if ((r = fs_subvol_lookup(t, src, &id)) < 0)
+        goto out;
+    for (unsigned n = 1;; n++) { /* a free name for the new live subvolume */
+        snprintf(fresh, sizeof fresh, "/@%u", n);
+        if (fs_stat(t, fresh, &st) == -ENOENT)
+            break;
+    }
+    /* 1. A writable copy of the checkpoint (this commits). */
+    if ((r = fs_subvol_snapshot(t, src, fresh, 0, &id)) < 0)
+        goto out;
+    /* 2. It becomes the default subvolume; 3. the old live one goes. */
+    if ((r = fs_set_default_subvol(b, id)) < 0)
+        goto out;
+    if (old_id != BTRFS_FS_TREE_OBJECTID && (r = fs_subvol_delete(t, old)) < 0)
+        goto out;
+    r = btrfs_commit(b);
+out:
+    fs_close(t);
+    return r;
+}
+
+int ckpt_delete(Btrfs *b, const char *name)
+{
+    char p[FS_NAME_MAX + 32];
+    if (!valid_name(name))
+        return -EINVAL;
+    Fs *t = top(b);
+    if (!t)
+        return -EIO;
+    ckpt_path(p, sizeof p, name);
+    int r = fs_subvol_delete(t, p);
+    fs_close(t);
+    return r;
+}
+
+Fs *ckpt_open_fs(Btrfs *b, const char *name)
+{
+    char p[FS_NAME_MAX + 32];
+    uint64_t id;
+    if (!valid_name(name))
+        return NULL;
+    Fs *t = top(b);
+    if (!t)
+        return NULL;
+    ckpt_path(p, sizeof p, name);
+    int r = fs_subvol_lookup(t, p, &id);
+    fs_close(t);
+    return r == 0 ? fs_open_subvol(b, id) : NULL;
+}
+
+int ckpt_rollback_back(Btrfs *b, uint32_t x)
+{
+    char name[CKPT_NAME_MAX + 1];
+    int r = ckpt_name_back(b, x, name);
+    return r ? r : ckpt_rollback(b, name);
 }
 
 /* ----------------------------------------------------- at fixed times */
@@ -87,21 +231,20 @@ uint32_t ckpt_count(Volume *v)
 #define AUTO_PREFIX "auto-"
 
 struct CkptTimer {
-    Volume *vol;
-    uint64_t interval; /* time between automatic checkpoints */
-    uint64_t next;     /* the next fixed time one is due     */
-    uint32_t keep;     /* automatic checkpoints to keep      */
+    Btrfs *b;
+    uint64_t interval, next;
+    uint32_t keep;
 };
 
-CkptTimer *ckpt_timer_create(Volume *v, uint64_t interval, uint32_t keep, uint64_t now)
+CkptTimer *ckpt_timer_create(Btrfs *b, uint64_t interval, uint32_t keep, uint64_t now)
 {
     CkptTimer *t = interval && keep ? malloc(sizeof *t) : NULL;
     if (!t)
         return NULL;
-    t->vol = v;
+    t->b = b;
     t->interval = interval;
     t->keep = keep;
-    t->next = (now / interval + 1) * interval; /* first fixed time after now */
+    t->next = (now / interval + 1) * interval;
     return t;
 }
 
@@ -115,17 +258,14 @@ uint64_t ckpt_timer_next(const CkptTimer *t)
     return t->next;
 }
 
-/* Delete the oldest automatic checkpoints until at most `keep` are left. */
-static void delete_old(Volume *v, uint32_t keep)
+static void delete_old(Btrfs *b, uint32_t keep)
 {
     char name[CKPT_NAME_MAX + 1];
-    uint32_t autos = 0;
-    uint32_t x = 1;
-
-    while (ckpt_name_back(v, x, name) == 0) { /* newest first */
+    uint32_t autos = 0, x = 1;
+    while (ckpt_name_back(b, x, name) == 0) {
         int is_auto = strncmp(name, AUTO_PREFIX, strlen(AUTO_PREFIX)) == 0;
         if (is_auto && ++autos > keep)
-            ckpt_delete(v, name); /* position x now holds the next older one */
+            ckpt_delete(b, name); /* position x now holds the next older one */
         else
             x++;
     }
@@ -134,20 +274,14 @@ static void delete_old(Volume *v, uint32_t keep)
 int ckpt_timer_tick(CkptTimer *t, uint64_t now)
 {
     char name[CKPT_NAME_MAX + 1];
-
     if (now < t->next)
-        return 0; /* not due yet */
-
-    /* The fixed time this checkpoint belongs to: the latest multiple of
-     * the interval that has passed. If several were missed (the caller
-     * did not tick for a while), one checkpoint covers them. */
+        return 0;
     uint64_t due = now / t->interval * t->interval;
     t->next = due + t->interval;
-
-    delete_old(t->vol, t->keep - 1); /* make room for the new one */
+    delete_old(t->b, t->keep - 1);
     snprintf(name, sizeof name, AUTO_PREFIX "%llu", (unsigned long long)due);
-    int r = ckpt_create(t->vol, name);
+    int r = ckpt_create(t->b, name);
     if (r == -EEXIST)
-        return 0; /* this fixed time already has its checkpoint */
+        return 0;
     return r ? r : 1;
 }

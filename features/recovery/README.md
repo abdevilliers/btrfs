@@ -1,75 +1,55 @@
 # Feature: recovery
 
-After a crash, the volume comes back exactly as it was at the last commit: the live
-pages and every checkpoint, and so the whole filesystem (files, directories, inodes)
-stored in them. `fs_open(v)` after `rec_mount` finds it, and `fs_check` is clean. It is never left half-changed.
+After a crash, the filesystem comes back exactly as it was at the last commit. That
+includes every file, subvolume and checkpoint. It also comes back when a commit was cut
+off, the primary superblock is damaged, or the newest root tree is.
 
 ```sh
-make test    # runs build/bin/test_recovery (with the other tests)
-make demo    # runs build/bin/demo_recovery: files, commit, crash, mount, on a file-backed disk
+make test    # build/bin/test_recovery
+make demo    # build/bin/demo_recovery: a file-backed disk; crash; a cut-off commit; a damaged superblock
 ```
-
-## Files
-
-| File | Contents |
-|---|---|
-| `include/recovery.h` | Public API: `rec_commit`, `rec_mount`, `rec_generation` |
-| `src/recovery.c` | The superblock, commit and mount, using only `volume.h` |
-| `tests/test_recovery.c` | Commit and crash, checkpoints surviving, a half-written commit, a file-backed disk, and 20,000 random operations with about 2,000 commits and 2,000 crashes compared with a model |
-| `demo/demo_recovery.c` | Files written, committed, changed, crash, mount: the committed files come back |
 
 ## Using it
 
 ```c
-Disk *disk = file_disk_open("volume.img", 128);
-Volume *v;
-if (rec_mount(disk, &v) == -ENOENT)   /* no commit on this disk yet */
-    v = vol_create(disk);
-
-vol_write(v, 0, "hello");
-rec_commit(v);                        /* durable from here */
+Disk *disk = file_disk_open("volume.img", 20000);
+Btrfs *b;
+if (rec_mount(disk, &b, NULL) == -ENOENT) {   /* no filesystem yet */
+    btrfs_mkfs(disk, NULL);
+    rec_mount(disk, &b, NULL);
+}
+Fs *fs = fs_open(b);
+fs_write(fs, "/a", 0, "hello", 5);
+rec_commit(b);                                /* durable from here */
 ```
 
-## How it works
+## Why a crash cannot break it (all in core)
 
-Three rules, two of them in core:
+1. **Copy-on-write:** nothing the last commit uses is ever overwritten. New tree blocks
+   and data go to free space.
+2. **Pinned extents:** space freed in a transaction is not reused until the transaction
+   has committed.
+3. **The commit order** (`core/src/transaction.c`): write every new block, flush, then
+   write the superblock pointing at the new root tree, to all its copies. Until the
+   primary superblock is written, the disk still says "the previous commit".
+   `core/tests/test_crash.c` cuts the power after every single write of a commit: the
+   result is always the old state or the new one, never a mix.
+4. **Verification:** every tree block read is checked against its checksum, its own
+   address, and the generation its parent expects. Damage is found, not trusted.
 
-1. **Nothing the last commit uses is overwritten.** `alloc_commit` (core) marks the
-   blocks in use at a commit; the allocator does not hand them out again until the
-   next commit, even if their count drops to 0. `node_cow` (core) copies a node
-   the last commit uses instead of changing it in place.
-2. **A commit is one small write.** All pages and tree nodes are already on the
-   disk, in blocks the last commit does not use. `rec_commit` writes a
-   **superblock** that says where the trees are: the live root and the root table
-   (from `vol_save`), a commit number and a checksum.
-3. **Two superblock slots.** Commit number g goes into slot g % 2, so a commit
-   never writes over the previous one. `rec_mount` reads both slots and uses the
-   newest one whose checksum is correct. If a commit was cut off halfway, its slot
-   fails the checksum and the previous commit is used.
+## What `rec_mount` tries
 
-```text
-blocks:  | 1 ......... 8 | 9 ........ 16 | 17 ...............................
-         |    slot 0     |    slot 1     |  pages and tree nodes (copy-on-write)
-```
+| Step | btrfs equivalent | When it helps |
+|---|---|---|
+| 1. mount | `mount` | The normal case |
+| 2. mount with backup roots | `mount -o usebackuproot` | The newest root tree is damaged: use the newest of the four backup roots that reads cleanly (usually the previous commit) |
+| 3. super-recover, then 1 and 2 | `btrfs rescue super-recover` | The primary superblock (at 64 KiB) is damaged: copy the newest good mirror (at 64 MiB) over it. It needs a disk larger than 64 MiB |
 
-`rec_commit(v)`:
-
-1. Fill in a superblock: commit number + 1, the state from `vol_save`, checksum.
-2. `disk_flush`: the new pages and nodes are really on the disk.
-3. Write the superblock into the slot the last commit did not use; `disk_flush`.
-4. `alloc_commit`: protect this state's blocks; release those only the previous
-   commit needed.
-
-`rec_mount(disk, &v)`:
-
-1. Read both slots; keep those with a correct checksum; take the higher commit
-   number.
-2. `vol_load` rebuilds the Volume from the saved state. Reference counts are not
-   stored: they are recomputed by walking the live tree and every checkpoint.
-3. `alloc_commit`: the loaded state is the committed one.
+`*how` says which step worked. `rec_generation(disk)` is the transaction id of the last
+commit on the disk.
 
 ## What a crash means in the tests
 
-`vol_destroy(v)` without a commit throws away everything in memory, which is what a
-power cut does. Only the blocks on the disk remain, and `rec_mount` must rebuild
-the volume from them.
+`btrfs_crash(b)` throws away everything in memory without committing, as a power cut
+does. `fault_disk_wrap` + `fault_disk_cut_after(d, n)` lets only n more writes reach the
+disk, so the power fails part-way through a commit.

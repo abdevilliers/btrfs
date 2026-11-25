@@ -1,309 +1,228 @@
-# The filesystem (`core/include/fs.h`, `core/src/fs*.c`)
+# How the filesystem works (`core/`)
 
-A Unix-style filesystem (superblock, inode table, directories, files) stored inside the
-copy-on-write volume. It uses the classic allocation algorithms from Maurice Bach, *The
-Design of the UNIX Operating System*, chapter 4:
-
-| Algorithm | Code | Job |
-|---|---|---|
-| `ialloc` | `fs_inode.c` | Assign a free inode to a new file or directory |
-| `ifree` | `fs_inode.c` | Release an inode when its last link is removed |
-| `alloc` | `fs_block.c` (`balloc`) | Assign a free data block to a file |
-| `free` | `fs_block.c` (`bfree`) | Release a data block |
-| `namei` | `fs_dir.c` | Turn a path into an inode number |
-| `bmap` | `fs_inode.c` | Turn a byte offset in a file into a data block |
-
-The files:
-
-| File | Contents |
-|---|---|
-| `fs_impl.h` | On-disk structures (private) |
-| `fs_block.c` | `bread` / `bwrite`, the superblock, `alloc` and `free` |
-| `fs_inode.c` | `iget` / `iupdate`, `ialloc`, `ifree`, `itrunc`, `bmap` |
-| `fs_dir.c` | Directory entries, `namei` |
-| `fs.c` | `mkfs` and the file operations |
-| `fs_check.c` | fsck |
-
-Every structure lives in the volume's pages, so everything below the filesystem keeps
-working without knowing about files:
-
-- **Checkpointing** snapshots the whole filesystem, including the inode table and both
-  free lists.
-- **Recovery** brings it all back after a crash.
-- **Duplication** can share a file's data blocks with a copy.
+This is a model of btrfs. The function names in the text are the Linux kernel's
+(`fs/btrfs/…`), so each one can be looked up in the real source.
 
 ```sh
-make test                                   # core/tests/test_fs.c: fsck after every step
-make shell                                  # an interactive shell (tools/fsh.c)
+make test                                   # core/tests: ctree, fs, subvol, crash
+make shell                                  # tools/fsh.c: try dump-tree 2 after a few writes
 build/bin/fsh demo.img < tools/demo_session.txt
 ```
 
-In the shell, `sb` prints the superblock's two free lists, so you can watch `ialloc`,
-`ifree`, `alloc` and `free` at work.
+## 1. Everything is an item in a B-tree
 
-## 1. Layout
-
-One filesystem block is one 128-byte volume page; there are 1,024 of them.
-
-```text
-block:  0            1 ............ 32     33 ............................ 1023
-      +------------+--------------------+-----------------------------------+
-      | superblock |    inode table     |            data blocks            |
-      |            | 64 inodes, 2/block | file contents, directory entries, |
-      |            |                    | and the free block list's blocks  |
-      +------------+--------------------+-----------------------------------+
-```
-
-## 2. The data structures
-
-### Superblock (block 0)
-
-```c
-typedef struct {
-    uint32_t magic, ninodes, nblocks, data_start, root_ino;
-    uint32_t tfree;              /* total free data blocks                       */
-    uint32_t tinode;             /* total free inodes                            */
-    uint32_t nfree;              /* entries used in free[]                       */
-    uint32_t free[12];           /* free block numbers; free[0] = the block that
-                                    holds the next part of the list (0 = end)    */
-    uint32_t ninode;             /* entries used in inode[]                      */
-    uint32_t inode[8];           /* free inode numbers                           */
-    uint32_t rinode;             /* the remembered inode                         */
-} Super;
-```
-
-As in Unix, each operation keeps an **in-core copy** of the superblock: it is loaded when
-the operation starts, changed in memory by the algorithms (which set a "modified" flag),
-and written back once when the operation ends.
-
-### Inode (64 bytes)
-
-```c
-typedef struct {
-    uint16_t type;           /* 0 = free, 1 = file, 2 = directory   */
-    uint16_t nlink;          /* directory entries pointing here     */
-    uint32_t size;           /* bytes                               */
-    uint32_t pad[2];
-    uint32_t direct[12];     /* data block of each file block       */
-} Dinode;
-```
-
-- Inode `n` is in block `1 + n / 2`. Inode 0 is never used; inode 1 is `/`.
-- **Type 0 means free.** That is how `ialloc`'s search recognises a free inode.
-- 12 direct blocks × 128 bytes = 1,536 bytes, the largest file.
-
-### Directory entry (32 bytes, 4 per block)
-
-`{ uint32_t ino; char name[28]; }`, where inode 0 marks an empty slot. Every directory has
-`.` and `..`.
-
-## 3. `ialloc` and `ifree`: the free inode list
-
-The superblock caches up to 8 free inode numbers, plus the **remembered inode**.
+btrfs stores no metadata at a fixed place, except the superblock. Every piece of
+metadata is an **item**, found by its **key** `(objectid, type, offset)`. Keys are sorted
+in that order. A **leaf** holds items; a **node** holds `(key, child block, child
+generation)` pointers.
 
 ```text
-superblock.inode[] = [ 8  7  6  5  4  3  2 ]     ninode = 7
-                                           ^ ialloc takes this one next (2)
-superblock.rinode  = 8
+leaf (nodesize bytes):
++--------+--------+--------+-----+-------------- free --------------+------+------+------+
+| header | item 0 | item 1 | ... |                                  |data 2|data 1|data 0|
++--------+--------+--------+-----+----------------------------------+------+------+------+
+  101 B    25 B each: key + offset + size         item data grows down from the end
+
+header: csum (crc32c) | fsid | bytenr | flags | generation | owner (tree id) | nritems | level
 ```
 
-### `ialloc` (Bach, figure 4.12)
+The trees are listed below. Each one's root block is recorded in the root tree; the root
+tree's own root block is in the superblock.
 
-```text
-while (not done) {
-    if (super block inode list is empty) {
-        search the inode table, from the remembered inode upwards,
-            for inodes of type 0, until the list is full or the table ends;
-        if (none found) return "no inode";              -> -ENOSPC
-        remembered inode = the highest one found;
-    }
-    take an inode number from the super block list;
-    read the inode (iget);
-    if (it is not free after all) continue;
-    initialise it (type, nlink = 0, size = 0, no blocks);
-    write it to the inode table;
-    total free inodes - 1;
-    return the inode;
-}
-```
-
-### `ifree` (Bach, figure 4.14)
-
-```text
-total free inodes + 1;
-if (super block inode list is full) {
-    if (inode number < remembered inode)
-        remembered inode = inode number;
-} else
-    put the inode number in the super block list;
-```
-
-Before calling `ifree`, the caller (`iremove`, Bach's `iput`) frees the file's blocks and
-sets the inode's type to 0.
-
-**Why the remembered inode works:** every free inode that is not in the list is at or
-above the remembered inode. So a search that starts there never misses one, and never
-has to scan the whole table. `ifree` lowers the remembered inode exactly when it cannot
-put an inode in the list. fsck checks this rule.
-
-**Worked example** (this is `test_ialloc_ifree` in `core/tests/test_fs.c`):
-
-| Step | List (top on the right) | Remembered | Result |
-|---|---|---|---|
-| mkfs: `ialloc` for `/` scans 1..8, takes 1 | 8 7 6 5 4 3 2 | 8 | `/` = inode 1 |
-| Create 7 files | (empty) | 8 | Inodes 2..8 |
-| Create `/f9`: the list is empty, so scan from 8 | 16 15 14 13 12 11 10 | 16 | Inode 9 |
-| Delete inode 3: the list has room | 16 … 10 3 | 16 | |
-| Delete inode 4: the list is full | 16 … 10 3 | **4** | |
-| Create 8 files | (empty) | 4 | Inodes 3, 10..16 |
-| Create one more: scan from 4 | 23 … 17 | 23 | **Inode 4** is found |
-
-## 4. `alloc` and `free`: the chained free block list
-
-The superblock holds up to 12 free block numbers. `free[0]` is special: it is the block
-that holds the **next** part of the list (or 0 at the end). So the free blocks form a
-chain of lists:
-
-```text
-superblock             block 40               block 52
-nfree = 7              nfree = 12             nfree = 12
-free[0] = 40 -------->  free[0] = 52 -------->  free[0] = 64 --> ... --> free[0] = 0 (end)
-free[1..6] = 39..34     free[1..11] = 11       free[1..11] = 11
-             ^ next     more free blocks       more free blocks
-```
-
-Every block in the chain is free, including the ones that hold a part of the list.
-
-### `alloc` (Bach, figure 4.19)
-
-```text
-remove a block number from the super block list (the top entry);
-if (it was free[0], the last entry) {
-    read that block;
-    copy the block numbers in it into the super block list;
-}
-zero the block;
-total free blocks - 1;
-mark the super block modified;
-return the block;
-```
-
-### `free` (Bach, figure 4.20; Unix V7 `free`)
-
-```text
-if (super block list is full) {
-    write the super block list into the block being freed;
-    empty the super block list;           /* that block becomes free[0] */
-}
-put the block number in the super block list;
-total free blocks + 1;
-mark the super block modified;
-```
-
-**`mkfs`** builds the chain by calling `free` for every data block, from 1023 down to 33,
-so the lowest numbers are handed out first. `/` then takes block 33 with `alloc`.
-
-**Worked example** (`test_alloc_free`): right after mkfs the list is `[link 40] 39 38
-37 36 35 34`.
-- A one-block file gets block 34, the top entry.
-- Allocating the next 6 blocks takes 35..39, and then 40, which is `free[0]`. Its list of
-  12 is copied into the superblock, and block 40 itself goes to the file.
-- Deleting that file frees its blocks. The first one freed finds the list full, so the list
-  is written into it and it becomes the new `free[0]`.
-
-## 5. How the file operations use them
-
-| Operation | Steps |
+| Tree (id) | Its items |
 |---|---|
-| `fs_create` | `namei` the parent → **`ialloc`** → add `{ino, name}` to the parent directory (`alloc` a new directory block if all are full) → `nlink = 1` |
-| `fs_mkdir` | Same, plus the entries `.` and `..`, `nlink = 2`, and the parent's `nlink` + 1 |
-| `fs_write` | For each file block touched: `bmap` (**`alloc`** if missing) → read → copy the bytes in → write. Then `size`, and write the inode |
-| `fs_read` | `namei` → for each block: `bmap` → read (a missing block reads as zeros) |
-| `fs_truncate` | Shrink: `itrunc` (**`free`** the blocks past the end) and zero the tail of the last block. Grow: just set `size` |
-| `fs_unlink` | Remove the entry → `nlink` − 1 → if 0: `itrunc` (**`free`** every block), type = 0, **`ifree`** |
-| `fs_rmdir` | Only if empty: the same, and the parent's `nlink` − 1 |
-| `fs_link` | Add a second entry for a file → `nlink` + 1 |
+| root tree (1) | `ROOT_ITEM` for every other tree; `ROOT_REF` / `ROOT_BACKREF` linking each subvolume to its directory; `ORPHAN_ITEM` for deleted subvolumes; the `default` directory item |
+| extent tree (2) | an `EXTENT_ITEM` / `METADATA_ITEM` per allocated extent, with its back-references; a `BLOCK_GROUP_ITEM` per block group |
+| FS tree (5, and 256+ for subvolumes) | per inode: `INODE_ITEM`, `INODE_REF`; per directory entry: `DIR_ITEM` + `DIR_INDEX`; per piece of file data: `EXTENT_DATA` |
+| csum tree (7) | `EXTENT_CSUM`: the crc32c of every data sector |
+| uuid tree (9) | subvolume uuid → id |
+| free space tree (10) | per block group, `FREE_SPACE_INFO` and its free ranges |
 
-### `namei`
+`build/bin/fsh` → `dump-tree 2` prints a tree's items exactly as `btrfs inspect-internal
+dump-tree` does.
 
-Bach's `namei` turns `/docs/report.txt` into an inode number:
-1. Start at inode 1 (`/`).
-2. Search its entries for `docs` → inode 2.
-3. Search inode 2's entries for `report.txt` → inode 3.
+## 2. Copy-on-write (`ctree.c`)
 
-## 6. Each operation is all or nothing
-
-One operation may change several blocks: `create` touches an inode block, a directory
-block and the superblock. If the disk fills up halfway, the filesystem would be left
-inconsistent. Copy-on-write makes the fix cheap:
+`btrfs_search_slot` walks from the root to a leaf. When the search is for a change, each
+block on the way is copied first (`btrfs_cow_block`). The copy goes to a new place, and
+the parent, itself already copied, is pointed at it. The committed tree is never
+changed. The copies form a new tree, which shares every block off the path:
 
 ```text
-hold the current tree (share its root: +1 reference)
-load the superblock
-do the operation
-write the superblock back if it changed
-if anything failed: make the held tree the live one again    -> undo everything
-let the held tree go
+before:            root A                    after a change under C:   root A'
+                  /      \                                            /      \
+                 B        C                                          B        C'
+                / \      / \                                                 / \
+               …   …    D   E                                               D   E'
 ```
 
-## 7. How the advanced features sit on top
+A block copied in the running transaction, and not yet written, may be changed in place
+(`should_cow_block`), so each block is copied at most once per transaction. On the way
+down, a full node is split, and for a delete a near-empty node is merged with a
+neighbour (`balance_level`). Leaves split where both halves fit, and merge after
+deletes.
+
+## 3. Who uses a block: references (`extent_tree.c`)
+
+Every extent, whether a tree block or data, has an item with a reference count and one
+**back-reference** item per user:
+
+| Back-reference | Meaning |
+|---|---|
+| `TREE_BLOCK_REF (bytenr, root)` | a block owned by tree `root` points here |
+| `SHARED_BLOCK_REF (bytenr, parent)` | tree block `parent` points here |
+| `EXTENT_DATA_REF (bytenr, hash)` = `{root, inode, offset, count}` | file data of `inode` in `root` |
+| `SHARED_DATA_REF (bytenr, parent)` = `{count}` | file data in leaf `parent` |
+
+The plain ("implicit") refs name the **owner of the parent** rather than the parent. A
+snapshot can then share a whole subtree while only the top of it gains a reference.
+When a block is shared and then copied, `update_ref_for_cow` decides what changes:
+
+| Block being copied | What happens |
+|---|---|
+| shared, owned by this tree, implicit refs | the block keeps its children through new SHARED refs (it gets `FULL_BACKREF`); the implicit refs now serve the copy |
+| shared, otherwise | the copy gives each child a reference |
+| only this tree uses it, `FULL_BACKREF` | the SHARED refs move to the copy |
+| only this tree uses it | the copy takes over the children's references |
+
+## 4. Delayed refs and pinned space (`delayed_ref.c`)
+
+Reference changes are not made at once. Each "+1" or "−1" is queued in a head per extent,
+and opposite changes cancel. The commit runs the queue: it inserts new extent items,
+adds and removes back-references, and deletes extents whose count reaches 0. Running
+them changes the extent tree, which queues more changes; the loop runs until nothing is
+left.
+
+An extent freed in a transaction is **pinned**: its space is not reused until the
+transaction has committed, because the previous commit may still use it. One exception
+is a tree block made and freed in the same transaction and never written: it is free at
+once (`check_ref_cleanup`).
+
+## 5. Space: block groups and the free space tree
+
+Disk space is handed out in **block groups** (chunks), each `DATA` or `METADATA`:
 
 ```text
-     checkpoint            duplication            recovery
-  (ckpt_create,          (dup_copy_file:        (rec_commit,
-   ckpt_open_fs,          ialloc + alloc,        rec_mount,
-   ckpt_rollback_back)    share data blocks)     then fs_open)
-          \                     |                     /
-           +------------- the filesystem ------------+
-                 create, write, read, update, delete
-                 ialloc/ifree, alloc/free, namei, bmap
-                               |
-                 the copy-on-write volume (pages)
+| 0 ... 1 MiB reserved (superblock at 64 KiB) | metadata bg | data bg | ... unallocated ... |
 ```
 
-- **Checkpoint:** shares the root of the tree holding every block above, so it is a
-  snapshot of all files and of both free lists. `ckpt_open_fs` reads it as a filesystem.
-- **Duplication:** `dup_copy_file` uses `fs_create` (`ialloc`) and `fs_bmap` (`alloc`)
-  to make a new file, then points each new block at the original's disk block.
-- **Recovery:** `rec_commit` makes every block durable; after a crash, `rec_mount` +
-  `fs_open` find the filesystem exactly as committed, and fsck is clean.
+A new block group takes 10% of the disk (at least 1 MiB) when one is needed
+(`btrfs_chunk_alloc`). The superblock copy at 64 MiB is excluded from any block group
+holding it. Free space is whatever no extent item covers. The **free space tree** records
+it per block group, so a mount reads it instead of scanning the extent tree. It is
+updated when delayed refs run.
 
-## 8. fsck: `fs_check`
+Before changing anything, an operation **reserves** the metadata it could need: per
+item, enough to copy and split a path of the deepest tree (`nodesize × 8 × 2`). It
+therefore fails with `-ENOSPC` before making a change. Writes reserve their data the
+same way. If space is short, a commit is tried first, because it turns pinned space back
+into free space. Deleting may use the **global reserve**, so a full disk can always be
+emptied.
 
-It checks everything from scratch and returns the number of problems. The tests run it
-after every operation.
+## 6. Files (`inode.c`, `file.c`)
 
-1. **The directory tree:** entries point at used inodes; `.` and `..` are right; no loops.
-2. **Link counts:** the entries found for each inode equal its `nlink`.
-3. **The free inode list:** entries are free and unique; every free inode not in the list
-   is at or above the remembered inode; the free inode total is right.
-4. **The free block list:** following the chain finds every data block no file uses,
-   exactly once; free blocks hold no data except the list's own blocks; the free block
-   total is right.
+```text
+(257 INODE_ITEM 0)            size 20000, nlink 1, nbytes 20480, mode 0100644
+(257 INODE_REF 256)           index 2, name "report.txt"       ← its name in dir 256
+(256 DIR_ITEM crc32c(name))   location (257 INODE_ITEM 0)      ← lookup by name
+(256 DIR_INDEX 2)             location (257 INODE_ITEM 0)      ← readdir order
+(257 EXTENT_DATA 0)           disk_bytenr 7340032, num_bytes 20480, offset 0
+```
 
-## 9. Limits (constants in `fs.h`)
+- New inode numbers are the highest in the tree + 1. "." and ".." are not stored. A
+  directory's size is twice the length of its names, and its nlink is 1.
+- A file of up to 2048 bytes is **inline**: its data is inside the `EXTENT_DATA` item.
+- A write never overwrites data. The new sectors go to a new extent, and
+  `__btrfs_drop_extents` cuts the old items out of the range. An item that sticks out on
+  both sides is split in two, and both halves reference the same extent (`count 2`). A
+  gap is just a missing item (NO_HOLES).
+- Every data sector's crc32c is stored in the csum tree and checked on read. A bad
+  sector reads as `-EIO`.
+- `fs_clone_range` (reflink) inserts items pointing at the source's extents, adding an
+  `EXTENT_DATA_REF` for each. No data is read or written.
+
+## 7. Subvolumes and snapshots (`root_tree.c`)
+
+A **subvolume** is an FS tree of its own. Its `ROOT_ITEM` is in the root tree, and a
+directory entry `(id, ROOT_ITEM, -1)` with a `ROOT_REF` / `ROOT_BACKREF` pair gives it a
+name. `fs_open` opens the **default** subvolume, which starts as 5.
+
+A **snapshot** is made inside the commit (`create_pending_snapshot`):
+
+1. The source's root block is copied once more. The copy belongs to the new subvolume,
+   and each of its children gains a reference from it (`btrfs_copy_root` +
+   `btrfs_inc_ref`).
+2. The source's `last_snapshot` becomes this transaction. Blocks at least that old may be
+   shared, so copy-on-write must look up their reference counts.
+3. Until the commit ends, every source block is copied before a change (`FORCE_COW`).
+
+**Deleting** a subvolume removes its name, sets its refs to 0 and adds an
+`ORPHAN_ITEM`. After the commit, the cleaner (`btrfs_drop_snapshot`) walks the tree. For
+each block, it drops this tree's reference. A block only this tree uses has its
+children's references dropped first. A shared block owned by this tree is first
+switched to SHARED refs (the `UPDATE_BACKREF` stage), because implicit refs naming a dead
+tree could never be matched by a later copy-on-write.
+
+## 8. Transactions, the superblock and recovery
+
+```text
+commit (btrfs_commit_transaction):
+  create pending block groups; run delayed refs
+  make pending snapshots; write changed subvolumes' root items
+  repeat: run delayed refs, write block group items, write the extent/csum/free space/uuid
+          trees' root items                                   (until nothing changes)
+  write every new tree block, with its checksum; flush
+  write the superblock to every copy (64 KiB, 64 MiB, 256 GiB); flush   ← durable here
+  pinned space becomes free; the cleaner runs
+```
+
+A crash before the superblock write leaves the previous commit. Nothing it uses was
+overwritten. `core/tests/test_crash.c` cuts the power after every single write of a
+commit and checks this.
+
+Each superblock keeps the **backup roots** of the last four commits. If the newest root
+tree is damaged, `mount -o usebackuproot` (`BtrfsMountOpts.usebackuproot`) uses the newest
+backup that reads cleanly. Like the kernel, mount reads only the primary superblock;
+`btrfs_super_recover` (btrfs rescue super-recover) copies a good mirror over a damaged
+primary.
+
+Every tree block read from the disk is verified against four things:
+
+- its checksum;
+- its own bytenr and the fsid;
+- the generation its parent's pointer expects, which catches a write that was lost or
+  went to the wrong place;
+- the level expected.
+
+## 9. btrfs check (`check.c`)
+
+`btrfs_check(disk)` mounts the committed state read-only and checks everything from
+scratch. The tests run it after nearly every commit.
+
+1. **Tree blocks:** each one's checksum, bytenr, fsid, generation and level, its key
+   order and item bounds, and that each node key equals its child's first key.
+2. **References:** walking every tree gives the back-references each extent should have.
+   They must equal the extent tree's exactly, and each `refs` must be their sum. Nothing
+   may be leaked or overlap.
+3. **Block groups:** each extent is in a block group of the right type, `used` adds up,
+   and so does the superblock's `bytes_used`.
+4. **Free space tree:** each block group minus its extents, exactly.
+5. **csum tree:** it covers exactly the data extents, and every data sector matches its
+   checksum (a scrub).
+6. **Subvolumes:** nlink against `INODE_REF`s; `DIR_ITEM`, `DIR_INDEX` and `INODE_REF`
+   agree; directory sizes; file extents are sorted, don't overlap, follow the inline
+   rules and add up to `nbytes`; `ROOT_REF`, `ROOT_BACKREF`, orphans and the uuid tree
+   are consistent.
+
+## 10. Limits
 
 | Limit | Value |
 |---|---|
-| Inodes | 64 (62 for files and directories after `/`) |
-| Inode numbers cached in the superblock (`FS_NICINOD`) | 8 |
-| Block numbers cached in the superblock (`FS_NICFREE`) | 12 |
-| Largest file | 12 blocks = 1,536 bytes |
-| Names per directory | 46 |
-| Longest name / path | 27 / 255 characters |
-| Data blocks | 991 × 128 bytes |
+| Sector | 4096 bytes |
+| Tree block (nodesize) | 4096 – 65536 (mkfs default 16384; the tests use 4096) |
+| Smallest disk | 4 MiB |
+| Inline file data | 2048 bytes |
+| Name / path | 255 / 4095 bytes |
+| Tree levels | 8 |
 
-Not included: rename, permissions and owners, timestamps, indirect blocks, the in-core
-inode table with reference counts and locks (there is one process, and the API is by
-path), and the buffer cache.
-
-## How this differs from real btrfs
-
-Btrfs has no inode table and no free lists of this kind:
-- Inodes and directory entries are items in its FS tree.
-- Free space is whatever the extent tree doesn't record as used.
-- New inode numbers come from the highest number in use plus one.
-
-This project uses the classic Unix layout and algorithms for files, and btrfs's ideas
-(copy-on-write, shared blocks with reference counts, checkpoints, a two-slot superblock)
-underneath them.
+For what is not modelled, see the end of [`README.md`](../README.md).

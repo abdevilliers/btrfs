@@ -1,40 +1,37 @@
 /*
- * recovery.h - make a Volume survive a crash.
+ * recovery.h - make the filesystem survive a crash, and get it back.
  *
- * rec_commit(v) makes the volume's current state durable. If the program
- * stops for any reason afterwards (a crash, a power cut, or simply
- * exiting), rec_mount(disk, &v) brings back exactly the state of the last
- * commit: the live pages and every checkpoint. Changes made after the
- * last commit are lost, but the volume is never left half-changed.
+ * btrfs never overwrites anything the last commit uses: new tree blocks
+ * and data go to free space, and space freed in a transaction stays
+ * reserved ("pinned") until the transaction has committed. A commit
+ * writes every new block, flushes, then writes the superblock (all its
+ * copies) pointing at the new root tree. A crash at any moment leaves
+ * either the old commit or the new one.
  *
- * How it works:
- *   - Nothing the last commit uses is ever overwritten (copy-on-write in
- *     core, see alloc_commit and node_cow).
- *   - A commit writes ONE small record, the superblock, which says where
- *     the trees are. There are two superblock slots at a fixed place on
- *     the disk; each commit writes the slot the previous commit did not
- *     use. So if a commit is interrupted, the previous one is still whole.
- *   - Mount reads both slots and uses the newest one whose checksum is
- *     correct.
+ * rec_mount brings back the last commit, trying what an administrator
+ * would, in order:
+ *   1. mount;
+ *   2. mount -o usebackuproot: the newest root tree that still reads
+ *      cleanly, from the four backup roots in the superblock;
+ *   3. btrfs rescue super-recover (if the primary superblock is damaged,
+ *      copy the newest good mirror over it), then 1 and 2 again.
  *
- * Uses only the public core API (volume.h).
+ * Uses only the public core API (fs.h).
  */
 #ifndef RECOVERY_H
 #define RECOVERY_H
 
 #include <stdint.h>
 
-#include "volume.h"
+#include "fs.h"
 
-/* Make the current state durable. 0 on success. */
-int rec_commit(Volume *v);
+int rec_commit(Btrfs *b);
 
-/* Open the volume stored on `disk` as of its last commit. On success *out
- * is a Volume to use (and later vol_destroy). -ENOENT if the disk has no
- * commit: start a new volume with vol_create instead. */
-int rec_mount(Disk *disk, Volume **out);
+/* -ENOENT if the disk holds no filesystem; -EIO if nothing could be
+ * recovered. *how (may be NULL) = 0 plain mount, 1 backup root, 2 after
+ * super-recover. */
+int rec_mount(Disk *disk, Btrfs **out, int *how);
 
-/* Number of the last commit on the disk (1, 2, 3, ...); 0 if none. */
-uint32_t rec_generation(Disk *disk);
+uint64_t rec_generation(Disk *disk); /* the last commit's transid; 0 if none */
 
 #endif

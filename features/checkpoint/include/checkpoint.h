@@ -1,80 +1,70 @@
 /*
- * checkpoint.h - checkpoints (snapshots) of a Volume.
+ * checkpoint.h - checkpoints of the live filesystem, as btrfs read-only
+ * snapshots (the way snapper uses them).
  *
- * A checkpoint is a read-only copy of the live volume as it was when it
- * was taken. Taking one copies NOTHING: the checkpoint is an entry in the
- * volume's root table that points at the live tree's root, and that root
- * gains one reference. Copy-on-write in the core tree (cowtree.c) then
- * keeps the live volume and the checkpoint apart as pages change.
+ * Layout, in the top-level subvolume (5):
  *
- * Checkpoints can be taken by hand (ckpt_create) or automatically at
- * fixed times (CkptTimer). Rollback works by name, or by position: "go
- * back x checkpoints".
+ *   /@                 the live subvolume: the default one, what fs_open opens
+ *   /.checkpoints/NAME a read-only snapshot of the live subvolume
  *
- * Uses only the public core API (volume.h).
+ * ckpt_setup makes this layout once, right after mkfs. A checkpoint copies
+ * one tree block (the snapshot's root); everything else is shared until
+ * copy-on-write separates it. Creating one commits the transaction, as
+ * `btrfs subvolume snapshot` does, so it survives a crash at once.
+ *
+ * Rolling back does what `snapper rollback` does: a WRITABLE snapshot of
+ * the checkpoint becomes the new live subvolume (the default), and the
+ * old live subvolume is deleted. Open the live filesystem again with
+ * fs_open() afterwards: handles on the old one return -ESTALE.
+ *
+ * Uses only the public core API (fs.h).
  */
 #ifndef CHECKPOINT_H
 #define CHECKPOINT_H
 
-#include <stddef.h>
 #include <stdint.h>
 
 #include "fs.h"
-#include "volume.h"
 
-#define CKPT_NAME_MAX VOL_NAME_MAX
+#define CKPT_NAME_MAX FS_NAME_MAX
+#define CKPT_DIR "/.checkpoints"
 
-/* ------------------------------------------------- by name */
+/* Make /@ the live (default) subvolume and /.checkpoints. 0 if it is
+ * already set up. */
+int ckpt_setup(Btrfs *b);
 
-int ckpt_create(Volume *v, const char *name);   /* -EEXIST, -ENOSPC, -EINVAL */
-int ckpt_read(Volume *v, const char *name, uint32_t page, char *buf, size_t len);
-int ckpt_rollback(Volume *v, const char *name); /* live volume = checkpoint   */
-int ckpt_delete(Volume *v, const char *name);   /* frees what only it used    */
+/* ------------------------------------------------------- by name */
 
-/* The filesystem as it was in a checkpoint, read-only (fs_read, fs_stat,
- * fs_readdir work; changes return -EROFS). Close it with fs_close before
- * the checkpoint is deleted. NULL if there is no such checkpoint, or no
- * filesystem in it. */
-Fs *ckpt_open_fs(Volume *v, const char *name);
+int ckpt_create(Btrfs *b, const char *name);   /* -EEXIST, -EINVAL */
+int ckpt_rollback(Btrfs *b, const char *name); /* live = a copy of it   */
+int ckpt_delete(Btrfs *b, const char *name);   /* frees what only it used, after the next commit */
 
-/* ------------------------------------------------- by position
+/* The filesystem as it was in a checkpoint: read-only (changes return
+ * -EROFS). NULL if there is no such checkpoint. */
+Fs *ckpt_open_fs(Btrfs *b, const char *name);
+
+/* ------------------------------------------------------- by position
  *
- * Checkpoints are counted from the newest: x = 1 is the most recent
- * checkpoint, x = 2 the one taken before it, and so on.
- *
- * ckpt_rollback_back makes the live volume equal to the x-th newest
- * checkpoint. No checkpoint is deleted, so it is possible to go back 5
- * and later return to a newer one. -ENOENT if there are fewer than x
- * checkpoints (or x is 0). */
-int ckpt_rollback_back(Volume *v, uint32_t x);
+ * x = 1 is the newest checkpoint, x = 2 the one before it, and so on.
+ * Going back does not delete any checkpoint, so it is possible to go
+ * back 5 and later return to a newer one. -ENOENT if there are fewer
+ * than x (or x is 0). */
+int ckpt_rollback_back(Btrfs *b, uint32_t x);
+int ckpt_name_back(Btrfs *b, uint32_t x, char *name); /* name: CKPT_NAME_MAX + 1 bytes */
+uint32_t ckpt_count(Btrfs *b);
 
-/* Name of the x-th newest checkpoint; `name` must hold CKPT_NAME_MAX + 1
- * bytes. -ENOENT if there are fewer than x. */
-int ckpt_name_back(Volume *v, uint32_t x, char *name);
-
-uint32_t ckpt_count(Volume *v); /* how many checkpoints exist */
-
-/* ------------------------------------------------- at fixed times
+/* ------------------------------------------------------- at fixed times
  *
  * A CkptTimer takes a checkpoint every `interval` time units, at the
- * fixed times interval, 2 * interval, 3 * interval, ... The checkpoint
- * taken at time T is named "auto-T". Only the newest `keep` automatic
- * checkpoints are kept; older ones are deleted. Checkpoints made by hand
- * are never deleted by the timer.
- *
- * The timer does not read a clock itself. The caller passes the current
- * time to ckpt_timer_tick, for example time(NULL) for real seconds, or a
- * counter in a test. Call it as often as convenient: it only acts when a
- * checkpoint is due. */
+ * fixed times interval, 2 * interval, ..., named "auto-T". Only the newest
+ * `keep` automatic checkpoints are kept; ones made by hand are never
+ * deleted by the timer. The caller passes the time to ckpt_timer_tick
+ * (time(NULL), or a counter in a test). */
 typedef struct CkptTimer CkptTimer;
 
-/* NULL if interval or keep is 0, or out of memory. `now` = current time. */
-CkptTimer *ckpt_timer_create(Volume *v, uint64_t interval, uint32_t keep, uint64_t now);
+CkptTimer *ckpt_timer_create(Btrfs *b, uint64_t interval, uint32_t keep, uint64_t now);
 void ckpt_timer_destroy(CkptTimer *t);
-
-/* 1 = a checkpoint was taken, 0 = none due yet, negative = error. */
-int ckpt_timer_tick(CkptTimer *t, uint64_t now);
-
-uint64_t ckpt_timer_next(const CkptTimer *t); /* when the next one is due */
+int ckpt_timer_tick(CkptTimer *t, uint64_t now); /* 1 = taken, 0 = not due, < 0 error */
+uint64_t ckpt_timer_next(const CkptTimer *t);
 
 #endif
