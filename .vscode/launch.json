@@ -6,7 +6,7 @@
       "type": "lldb",
       "request": "launch",
       "preLaunchTask": "make",
-      "program": "${workspaceFolder}/build/bin/demo_checkpoint",
+      "program": "${workspaceFolder}/build/demo",
       "args": [],
       "cwd": "${workspaceFolder}"
     },
@@ -15,7 +15,7 @@
       "type": "lldb",
       "request": "launch",
       "preLaunchTask": "make",
-      "program": "${workspaceFolder}/build/bin/test_checkpoint",
+      "program": "${workspaceFolder}/build/tests",
       "args": [],
       "cwd": "${workspaceFolder}"
     }

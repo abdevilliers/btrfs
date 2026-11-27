@@ -1,141 +1,118 @@
-# btrfs: a working model of the btrfs filesystem, in C
+# toy-btrfs
 
-The **core** in `core/` is a working model of btrfs. It uses the btrfs on-disk format, the
-same trees and the same algorithms as the Linux kernel's `fs/btrfs`, in about 6,700
-readable lines. Each team member builds one **feature** on top of it, in its own folder.
+A small, readable model of the **btrfs** copy-on-write filesystem in C11
+(~650 lines of library code, ~1,500 including tests, demo and shell), with three advanced features:
 
-| Part | Folder | Status |
+| Feature | What it does | btrfs equivalent |
 |---|---|---|
-| The filesystem: copy-on-write B-trees, extent tree with back-references, delayed refs, block groups, free space tree, checksums, transactions, subvolumes, snapshots, reflinks, `btrfs check` | `core/` (`fs.h`, see [`core/FILESYSTEM.md`](core/FILESYSTEM.md)) | Done: tests, a shell |
-| Checkpointing: read-only snapshots, rollback by name or "go back x", timed | `features/checkpoint/` | Done: tests and demos |
-| Duplication: reflink copies (`cp --reflink`) | `features/duplication/` | Done: tests and demo |
-| Recovery: commit, crash, mount, backup roots, super-recover | `features/recovery/` | Done: tests and demo |
-| Backup (send/receive) | `features/backup/` | To do |
+| **Checkpointing** | Named read-only copies of the whole filesystem; roll back **any number of checkpoints back**, or forward again | Snapshots |
+| **Duplication** | Copy a file without copying its data (blocks are shared, split on write) | `cp --reflink` |
+| **Recovery** | Commit in a crash-safe order; mount from the newest valid superblock (primary or mirror) | Transaction commit + superblock mirrors |
+
+All three are built on one mechanism: **shared blocks with reference counts**.
 
 ## Build and run
 
+Requires a C11 compiler and `make` (macOS or Linux).
+
 ```sh
-make          # build everything into build/
-make test     # core tests, then every feature's tests
-make demo     # every feature's demo
-make shell    # an interactive shell on fsh.img (tools/fsh.c)
+make            # builds build/tests, build/demo, build/btrfs-shell
+make test       # automated tests for core + every feature
+make demo       # narrated walk-through of every feature
+./build/demo --pause    # same, waits for Enter between steps (for recording)
+make shell      # interactive shell on disk.img (persists between runs)
 make clean
 ```
 
-This needs only a C11 compiler (clang on macOS, gcc on Linux) and `make`. The build turns
-on strict warnings (`-Wconversion`, `-Wshadow`, …) and compiles with none. The on-disk
-structures are little-endian, so the code needs a little-endian machine (x86-64, arm64).
+## Project layout
 
-## Layout
-
-```text
-btrfs/
-├── Makefile                  finds every feature automatically
-├── core/                     SHARED by all features: change with care
-│   ├── include/              public headers: the only ones features may include
-│   │   ├── fs.h              the API: mkfs, mount, commit, files, subvolumes, check
-│   │   ├── btrfs_tree.h      the on-disk format (keys, item types, structures)
-│   │   ├── disk.h            Disk: a simulated disk of 4 KiB sectors
-│   │   ├── mem_disk.h        a Disk in RAM
-│   │   ├── file_disk.h       a Disk in a file (survives the program)
-│   │   └── fault_disk.h      a Disk that loses power after n writes (crash tests)
-│   ├── src/                  the implementation; ctree.h is private
-│   │   ├── ctree.c           the B-tree: search, copy-on-write, split, merge
-│   │   ├── extent_tree.c     extent items, back-references, allocation, block groups
-│   │   ├── delayed_ref.c     reference count changes, queued until commit
-│   │   ├── free_space.c      free space in memory and in the free space tree
-│   │   ├── transaction.c     start, abort, commit
-│   │   ├── disk_io.c         superblocks, mkfs, mount, super-recover
-│   │   ├── root_tree.c       subvolumes, snapshots, drop_snapshot
-│   │   ├── inode.c           inodes, directories, path lookup
-│   │   ├── file.c            file data: read, write, truncate, reflink, fiemap
-│   │   ├── check.c           btrfs check
-│   │   └── print_tree.c      dump-tree, dump-super
-│   ├── tests/                test_ctree, test_fs, test_subvol, test_crash
-│   └── FILESYSTEM.md         how it works
-├── tools/fsh.c               the shell (and demo_session.txt)
-└── features/
-    ├── checkpoint/           include/ src/ tests/ demo/ README.md
-    ├── duplication/          same shape
-    ├── recovery/             same shape
-    └── backup/               README.md: where to start
+```
+core/                      shared by every feature
+  disk.h/.c                abstract Disk (method table) + RAM disk + file disk
+  allocator.h/.c           free space + refcount per block      (extent tree)
+  cowtree.h/.c             copy-on-write tree page -> block     (FS tree)
+  volume.h/.c              live tree + root table of checkpoints (root tree)
+  fs.h/.c                  inodes, file read/write/delete       (INODE/DIR/EXTENT items)
+features/
+  checkpoint/              ckpt_create/read/list/rollback/rollback_back/delete
+  duplication/             dup_copy_page, dup_copy_file (reflink)
+  recovery/                Superblock, rec_format, rec_commit, rec_mount
+tools/btrfs-shell.c        interactive shell
+demo/demo.c                narrated demo
+tests/tests.c              automated tests
+docs/DESIGN.md             data structures and algorithms in detail
 ```
 
-```text
-   checkpoint   duplication   recovery   backup      features (one owner each)
-        \           |            |         /
-         └──────────── fs.h ──────────────┘          core: the public API
-                         │
-   subvolumes, files  (root_tree.c, inode.c, file.c)
-                         │
-   transactions  (transaction.c, disk_io.c)
-                         │
-   B-trees + extent tree + delayed refs + free space  (ctree.c, extent_tree.c, ...)
-                         │
-                  disk.h ← mem_disk.h, file_disk.h, fault_disk.h
+Layers only call downward: `features → fs → volume → cowtree → allocator → disk`.
+
+## On-disk layout
+
+Block size 4 KiB, disk size 1024 blocks (4 MiB).
+
+```
+block 0      boot (unused)
+block 1      superblock          magic, checksum, generation, live root, slot
+block 2      superblock mirror
+block 3,4    slot 0: root table, refcount table
+block 5,6    slot 1: root table, refcount table   (commits alternate slots)
+block 7 ...  tree nodes and data blocks
 ```
 
-## Rules that keep features independent
+Inside every tree (the live filesystem and every checkpoint):
 
-1. **Core never includes a feature.** Dependencies point one way only: features → core.
-2. **Features include only `core/include/*.h`**, and other features' `include/` if they
-   really need them. The Makefile builds features *without* access to `core/src`.
-   Core's own tests may use `core/src/ctree.h`.
-3. **Each handle is opaque.** `Btrfs` (a mounted filesystem) and `Fs` (one subvolume of
-   it) are declared in `fs.h`; their layout is private.
-4. **`btrfs_check(disk)` must stay clean.** Commit, then check: it rebuilds every
-   reference count from the trees and compares it with the extent tree. Every test does
-   this.
-5. **Errors are negative errno values** (`-ENOENT`, `-EEXIST`, `-ENOSPC`, `-EROFS`, …).
-   0 means success. An error after a change has started aborts the transaction: the
-   filesystem turns read-only, and the disk keeps the last commit.
-6. **A change to core is a change for everyone.** Run `make test` before pushing.
+```
+page 0              inode table (15 inodes, a flat root directory)
+page 1 + i*16 + k   page k of the file in inode slot i   (max 64 KiB per file)
+```
 
-## What core gives a feature
+## Shell commands
 
-| Need | Core API (`fs.h`) |
-|---|---|
-| Make, mount, commit, unmount, crash | `btrfs_mkfs`, `btrfs_mount`, `btrfs_commit`, `btrfs_unmount`, `btrfs_crash` |
-| Files and directories | `fs_create`, `fs_mkdir`, `fs_write`, `fs_read`, `fs_truncate`, `fs_unlink`, `fs_rmdir`, `fs_link`, `fs_stat`, `fs_readdir` |
-| Subvolumes and snapshots | `fs_subvol_create`, `fs_subvol_snapshot`, `fs_subvol_delete`, `fs_subvol_list`, `fs_subvol_info`, `fs_set_default_subvol` |
-| Open a subvolume | `fs_open` (the default one), `fs_open_subvol` |
-| Share data between files | `fs_clone_range` (FICLONERANGE) |
-| Where a file's data is | `fs_fiemap` |
-| Space | `fs_space` |
-| Read any tree's items (send/receive, inspection) | `btrfs_tree_search`, `btrfs_dump_tree`, `btrfs_dump_super` |
-| Check everything | `btrfs_check` |
-| Recover | `btrfs_mount` with `usebackuproot`, `btrfs_super_recover` |
-| Simulate a power cut | `fault_disk_wrap`, `fault_disk_cut_after` |
+```
+ls | write <f> <text> | fill <f> <kb> <char> | cat <f> | rm <f> | blocks <f>
+checkpoint <name> | checkpoints | rollback <N> | rollback-to <name>
+rollback-drop <N> | ckpt-ls <name> | ckpt-cat <name> <f> | ckpt-rm <name>
+cp <src> <dst>                                   (reflink copy)
+commit | crash | corrupt-sb | exit               (exit = commit + quit)
+info | check | format | help
+```
 
-## How close is this to real btrfs?
+`rollback N` makes the live filesystem equal to the checkpoint **N back**
+(1 = newest). Newer checkpoints are kept so you can roll forward again;
+`rollback-drop N` also deletes the newer ones.
 
-It uses the btrfs on-disk structures (`btrfs_tree.h`), byte for byte. The main
-mechanisms are btrfs's own:
+## How each feature works (short version)
 
-- keyed B-trees that are copied on write;
-- the root, extent, FS, csum, free space and uuid trees;
-- implicit and full back-references;
-- `update_ref_for_cow` and `btrfs_drop_snapshot`;
-- delayed refs, pinned extents, block groups and the global reserve;
-- metadata reservations;
-- inline extents, `__btrfs_drop_extents`, NO_HOLES and crc32c data checksums;
-- superblock mirrors with backup roots;
-- subvolumes, snapshots made during commit, and the cleaner.
+**Copy-on-write.** A tree node is changed in place only if exactly one
+parent uses it *and* it is not part of the last commit. Otherwise it is
+copied, each child gains a reference (the copy is a second parent), and
+the old node loses one. Data is never overwritten: every write goes to a
+new block.
 
-These parts are left out or simplified:
+**Checkpointing.** `ckpt_create` adds a root-table entry pointing at the
+live root and increments the root's refcount — 0 blocks copied. Later
+writes copy only the changed path. Rollback points the live tree at the
+checkpoint's root (+1) and drops the old live tree, which frees only blocks
+nothing else uses. Checkpoints are ordered by id, so any of them can be the
+target.
 
-- **One device only.** There is no chunk tree, no device tree and no RAID or DUP
-  profiles. Logical addresses are physical. The superblock's `sys_chunk_array` is empty.
-- **No compression, log tree (fsync), quotas, xattrs, rename, permissions or
-  relocation.** Timestamps are kept, at whole seconds.
-- **Writes go straight to the disk.** btrfs buffers dirty pages and allocates when it
-  writes them back (delalloc). Commits happen when asked, when a snapshot is taken, or
-  when space is short. btrfs also commits every 30 seconds.
-- **Back-references are always separate items.** btrfs normally stores most of them
-  inline, inside the extent item. Both forms are valid btrfs.
-- **Leaves are not "pushed" into neighbours before a split**, and the free space tree
-  never uses bitmaps. Data allocation is first-fit, with no clusters.
-- **A snapshot does not show the subvolumes nested in its source.** btrfs shows them as
-  empty directories; here they are skipped.
-- **Single-threaded:** there are no locks, no worker threads and no cleaner thread. The
-  cleaner runs after each commit.
+**Duplication.** For each page: look up the source block, increment its
+refcount, point the destination page at it. Writing either file later
+gives that page a new block; the shared block's count drops back to 1.
+
+**Recovery.** `rec_commit` writes the root table and refcounts to the
+spare slot, flushes, writes the superblock (generation+1) then the mirror,
+then records the counts as "committed". The allocator never reuses a block
+the last commit uses, so the committed tree is intact whatever happens
+afterwards. `rec_mount` validates both superblocks by CRC32 and loads the
+newest.
+
+`vol_check()` recomputes every refcount from the trees and compares; the
+tests and demo assert it returns 0 after every scenario.
+
+## Simplifications compared to real btrfs
+
+- Fixed-shape radix tree (fanout 4, depth 4) instead of key-sorted B-trees with splitting.
+- One flat directory, 15 files, 64 KiB per file; no permissions or timestamps.
+- One device, no chunk tree / RAID / compression / data checksums.
+- Refcounts kept as one table (written whole at commit) instead of an extent tree.
+- Disk-full ends the program instead of returning ENOSPC.

@@ -1,78 +1,40 @@
-# btrfs - a model of the btrfs filesystem, in C.
-#
-#   make            build every library, test and demo into build/
-#   make test       run core tests, then every feature's tests
-#   make demo       run every feature's demo
-#   make shell      the filesystem shell (tools/fsh.c), on fsh.img
+# toy-btrfs
+#   make          build everything into build/
+#   make test     run the automated tests
+#   make demo     run the narrated demo (good for a screen recording)
+#   make shell    interactive shell on disk.img
 #   make clean
-#
-# Features are found automatically: any folder features/<name>/ with
-#   include/*.h   public header(s)       src/*.c   implementation
-#   tests/*.c     test programs           demo/*.c  demo programs
-# is built and linked. Nothing in this file needs to change to add one.
 
-CC     ?= cc
-CFLAGS ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
+CC      ?= cc
+CFLAGS  ?= -std=c11 -Wall -Wextra -g -O1
+INC     := -Icore -Ifeatures/checkpoint -Ifeatures/duplication -Ifeatures/recovery
+SRC     := $(wildcard core/*.c) $(wildcard features/*/*.c)
+HDR     := $(wildcard core/*.h) $(wildcard features/*/*.h)
 
-BUILD    := build
-FEATURES := $(notdir $(wildcard features/*))
+all: build/tests build/demo build/btrfs-shell
 
-CORE_SRC := $(wildcard core/src/*.c)
-FEAT_SRC := $(foreach f,$(FEATURES),$(wildcard features/$(f)/src/*.c))
-OBJS     := $(patsubst %.c,$(BUILD)/%.o,$(CORE_SRC) $(FEAT_SRC))
-LIB      := $(BUILD)/libbtrfs.a
+build/tests: tests/tests.c $(SRC) $(HDR) | build
+	$(CC) $(CFLAGS) $(INC) -o $@ $(SRC) $<
 
-# Public headers only: features see core/include and each other's include/.
-INCLUDES := -Icore/include $(foreach f,$(FEATURES),-Ifeatures/$(f)/include)
-HEADERS  := $(wildcard core/include/*.h core/src/*.h features/*/include/*.h)
+build/demo: demo/demo.c $(SRC) $(HDR) | build
+	$(CC) $(CFLAGS) $(INC) -o $@ $(SRC) $<
 
-TEST_SRC := $(wildcard core/tests/*.c) $(foreach f,$(FEATURES),$(wildcard features/$(f)/tests/*.c))
-DEMO_SRC := $(foreach f,$(FEATURES),$(wildcard features/$(f)/demo/*.c))
-TOOL_SRC := $(wildcard tools/*.c)
-TESTS    := $(addprefix $(BUILD)/bin/,$(basename $(notdir $(TEST_SRC))))
-DEMOS    := $(addprefix $(BUILD)/bin/,$(basename $(notdir $(DEMO_SRC))))
-TOOLS    := $(addprefix $(BUILD)/bin/,$(basename $(notdir $(TOOL_SRC))))
+build/btrfs-shell: tools/btrfs-shell.c $(SRC) $(HDR) | build
+	$(CC) $(CFLAGS) $(INC) -o $@ $(SRC) $<
 
-CORE_TESTS := $(addprefix $(BUILD)/bin/,$(basename $(notdir $(wildcard core/tests/*.c))))
+build:
+	mkdir -p build
 
-vpath %.c $(sort $(dir $(TEST_SRC) $(DEMO_SRC) $(TOOL_SRC)))
+test: build/tests
+	./build/tests
 
-all: $(LIB) $(TESTS) $(DEMOS) $(TOOLS)
+demo: build/demo
+	./build/demo
 
-# Core may also use its private headers in core/src (e.g. disk_impl.h).
-$(BUILD)/core/%.o: core/%.c $(HEADERS)
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(INCLUDES) -Icore/src -c $< -o $@
-
-# Features get public headers only.
-$(BUILD)/features/%.o: features/%.c $(HEADERS)
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(LIB): $(OBJS)
-	@mkdir -p $(dir $@)
-	ar rcs $@ $^
-
-# Core tests may also look inside (core/src/ctree.h): they test the B-tree directly.
-$(CORE_TESTS): $(BUILD)/bin/%: core/tests/%.c $(LIB) $(HEADERS)
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(INCLUDES) -Icore/src $< $(LIB) -o $@
-
-$(BUILD)/bin/%: %.c $(LIB) $(HEADERS)
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(INCLUDES) $< $(LIB) -o $@
-
-test: $(TESTS)
-	@set -e; for t in $(TESTS); do echo "== $$t"; ./$$t; done
-
-demo: $(DEMOS)
-	@set -e; for d in $(DEMOS); do echo "== $$d"; ./$$d; done
-
-# The filesystem shell: an interactive session on fsh.img.
-shell: $(BUILD)/bin/fsh
-	./$(BUILD)/bin/fsh
+shell: build/btrfs-shell
+	./build/btrfs-shell disk.img
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf build disk.img
 
 .PHONY: all test demo shell clean
